@@ -1,0 +1,16 @@
+{
+  "name": "telegram-claude-bridge",
+  "version": "1.0.0",
+  "description": "Control a local Claude Code harness from Telegram (proxy-aware, works behind censored networks)",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.6",
+    "socks-proxy-agent": "^8.0.5"
+  }
+}
