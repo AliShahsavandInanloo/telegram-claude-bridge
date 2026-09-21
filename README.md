@@ -9,13 +9,25 @@ VPN/proxy you run. **Nothing is hard-coded** — the bridge auto-detects the rou
 3. **Windows system proxy** (read live from the registry — what v2rayN-style clients toggle)
 4. Direct connection
 
-It re-checks whenever a request fails (and every 60 s), so you can start/stop your
-VPN whenever you like and the bridge recovers on its own.
+Bot API calls go through `https.request` (not `fetch`), so HTTP(S) and SOCKS proxy
+agents actually apply. Local proxies (`127.0.0.1`, `localhost`) are fully supported.
+The route is re-checked whenever a request fails (and every 60 s), so you can
+start/stop your VPN whenever you like and the bridge recovers on its own.
 
 Your model provider setup is untouched: the bridge just spawns the `claude` CLI,
 which reads your own `~/.claude/settings.json` (any `ANTHROPIC_BASE_URL` relay,
-custom model mappings, etc. all keep working). Works with any user and any bot —
-the bot's name shown in help text is fetched from Telegram at runtime.
+custom model mappings, etc. all keep working).
+
+## Security model (read this first)
+
+Authorization is **fail closed**: the bridge refuses to start unless
+`ALLOWED_TELEGRAM_IDS` lists your numeric Telegram user ID(s). Unknown users are
+ignored and can never enqueue work, create sessions, or see status.
+
+Every job runs `claude -p` **with `--dangerously-skip-permissions`** in the
+configured working directory — that means anyone who can talk to the bot can run
+arbitrary commands on this machine. The allowlist is the security boundary:
+keep it to you and people you trust, and never ship a `.env` with it empty.
 
 ## One-time setup
 
@@ -28,15 +40,14 @@ copy .env.example .env
 
 (Linux/macOS: `cp .env.example .env`)
 
-Then edit `.env`:
+Then edit `.env` — both variables are required:
 
 - `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather) for **your** bot
-- `ALLOWED_TELEGRAM_IDS` — your numeric Telegram user ID(s), comma-separated
-  (get it from @userinfobot; leave empty to let the first person who messages claim
-  the bot — not recommended, see Security in the docs)
+- `ALLOWED_TELEGRAM_IDS` — your numeric Telegram user ID(s), comma-separated (get
+  them from @userinfobot)
 
-Optional: `TELEGRAM_PROXY_URL` (pin a proxy), `CLAUDE_BIN` (claude not on PATH),
-`BRIDGE_CWD` (where Claude jobs run).
+Optional: `TELEGRAM_PROXY_URL`, `CLAUDE_BIN`, `BRIDGE_CWD`, `CLAUDE_TIMEOUT_MS`,
+`MAX_QUEUE_PER_CHAT`, `MAX_STDOUT_BYTES`, `MAX_STDERR_BYTES`, `BRIDGE_DEBUG`.
 
 ## Run
 
@@ -46,33 +57,55 @@ Double-click `start-bridge.cmd`, or:
 node bridge.js
 ```
 
-Startup log lines show the authorized bot name, chosen proxy route, and access mode.
+Startup registers the commands with Telegram (`setMyCommands`), so typing `/` in
+the chat shows an autocomplete menu. The log shows the bot name, chosen proxy
+route, and how many users are authorized.
 
-## Using it from Telegram
+## Telegram commands
 
 | Command | Effect |
 |---|---|
-| `/new <name>` | create + switch to a fresh named session |
-| `/sessions` | list sessions, mark the active one |
-| `/use <name>` | switch active session |
-| `/stop` | clear queued jobs for this chat |
-| `/status` | show proxy route, queue depth, active session |
-| any text | becomes a task for the active session; the final report is sent back here |
+| `/start`, `/help` | show the command summary |
+| `/new <name>` | create a fresh named session and switch to it |
+| `/sessions` | list sessions; `▶️` marks the active one, `(new)` = not yet used by Claude |
+| `/use <name>` | switch the active session |
+| `/stop` | cancel the running job (if it belongs to this chat) and clear this chat's queued jobs |
+| `/queue` | what's running and how many jobs are queued (this chat / global) |
+| `/status` | Claude executable, active session, job state, queue, proxy (credentials redacted), uptime |
+| any other text | becomes the prompt for the active session; the report is sent back here |
 
-Sessions are persistent (UUID-backed, resumed via `claude --resume`), so context
-survives bridge restarts. Each message runs as one `claude -p` job with
-`--dangerously-skip-permissions` in the configured working directory — treat the
-bot as someone with full access to this machine: keep `ALLOWED_TELEGRAM_IDS` set
-to you only.
+Commands also work group-style: `/status@YourBot` is accepted, and commands
+addressed to a different bot are ignored.
+
+## Sessions
+
+A session is one persistent Claude conversation. `/new` allocates it locally with
+`--session-id`; the first successful run makes it resumable, and every later job
+resumes with `--resume`. Queued jobs keep the session identity they were enqueued
+with, even if you create or switch sessions meanwhile. State lives in
+`state/sessions.json` (written atomically); old flat-format files are migrated
+automatically.
+
+## Tests
+
+```cmd
+npm test
+```
+
+30 sandboxed tests cover auth, prompt passing, session lifecycle, queue fairness,
+proxy parsing/redaction, atomic persistence, and crash safety. No network or
+`claude` process is touched.
 
 ## Troubleshooting
 
-- `poll error: fetch failed` repeating → your VPN is off; turn it on, the bridge
-  re-probes within 10 s. Or set `TELEGRAM_PROXY_URL` explicitly.
+- `refusing to start: ALLOWED_TELEGRAM_IDS …` → set your numeric ID(s) in `.env`.
+- `cannot reach Telegram yet` repeating → your VPN is off; turn it on, the bridge
+  re-probes within 10 s. Or pin `TELEGRAM_PROXY_URL`.
 - 401 from Telegram → wrong `TELEGRAM_BOT_TOKEN`.
-- Job outputs nothing → check that `claude -p "hi"` works in a terminal; set
+- `Could not run Claude` → check `claude -p "hi"` works in a terminal; set
   `CLAUDE_BIN` if `claude` isn't on PATH.
-- Large replies are split into chunks; Markdown that fails to parse is re-sent as plain text.
+- Large replies are split into chunks; stdout/stderr capture is bounded
+  (`MAX_STDOUT_BYTES`/`MAX_STDERR_BYTES`) with truncation markers.
 
 ---
 

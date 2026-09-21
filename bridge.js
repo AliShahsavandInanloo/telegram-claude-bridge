@@ -1,42 +1,59 @@
 #!/usr/bin/env node
 /**
  * Telegram <-> Claude Code bridge
- * --------------------------------
+ * -------------------------------
  * Polls Telegram for messages (long polling), forwards each allowed user's
- * message to a persistent `claude -p` session, and replies with the result.
+ * message as the prompt to a persistent `claude -p` session, and replies with
+ * the result.
  *
- * Designed for censored networks (no hard-coded infrastructure):
- *   1. TELEGRAM_PROXY_URL in .env (socks5://user:pass@host:port or http://...)
+ * Security: authorization is FAIL CLOSED — ALLOWED_TELEGRAM_IDS must list the
+ * permitted Telegram user IDs; Claude runs with --dangerously-skip-permissions.
+ *
+ * Proxy support (no hard-coded infrastructure, VPN can be toggled freely):
+ *   1. TELEGRAM_PROXY_URL in .env (socks5:// or http(s)://)
  *   2. HTTPS_PROXY / HTTP_PROXY / ALL_PROXY environment variables
- *   3. Windows system proxy (read live from the registry — what VPN clients set)
+ *   3. Windows system proxy (read live from the registry)
  *   4. Direct connection
- * Proxy is re-resolved automatically whenever requests fail, so you can turn
- * your VPN on/off at any time and the bridge recovers on its own.
+ * Bot API calls go through https.request so http/socks proxy agents actually
+ * apply (built-in fetch would silently ignore them).
  *
- * Commands: /new <name>, /sessions, /stop, /stop <name>, /queue, /status
+ * Commands: /start /help /new /sessions /use /stop /queue /status
+ * (registered with Telegram via setMyCommands for slash autocomplete)
  */
 
 'use strict';
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
-const { execFile, spawn } = require('child_process');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { SocksProxyAgent } = require('socks-proxy-agent');
+const { spawn } = require('child_process');
+
+const { createTelegramClient } = require('./lib/telegram');
+const { createSessionStore } = require('./lib/sessions');
+const { createJobQueue } = require('./lib/queue');
+const { BOT_COMMANDS, parseCommand, helpText } = require('./lib/commands');
+const {
+  parseAllowlist,
+  intEnv,
+  validateProxyUrl,
+  validateBotToken,
+  ensureWritableDir,
+  resolveClaudeBin,
+} = require('./lib/config');
 
 // ---------------------------------------------------------------------------
-// Config
+// .env loading (before config validation)
 // ---------------------------------------------------------------------------
 
 const ROOT = __dirname;
-const STATE_DIR = path.join(ROOT, 'state');
+const STATE_DIR = process.env.BRIDGE_STATE_DIR || path.join(ROOT, 'state'); // overridable for tests
 const SESSIONS_FILE = path.join(STATE_DIR, 'sessions.json');
+const OFFSET_FILE = path.join(STATE_DIR, 'offset.txt');
 
 function loadEnvFile() {
   const envPath = path.join(ROOT, '.env');
   if (!fs.existsSync(envPath)) return;
   for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    if (!line || line.trim().startsWith('#')) continue;
     const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
     if (!m) continue;
     let v = m[2];
@@ -48,432 +65,602 @@ function loadEnvFile() {
 }
 loadEnvFile();
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_CLAUDE_BOT_TOKEN || '';
-const EXPLICIT_PROXY = process.env.TELEGRAM_PROXY_URL || '';
-const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'; // claude executable if not on PATH
-const DEFAULT_CWD = process.env.BRIDGE_CWD || ROOT;    // where Claude jobs run
-const ALLOWED = new Set(
-  (process.env.ALLOWED_TELEGRAM_IDS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
-const OPEN_ACCESS = ALLOWED.size === 0; // first user to talk to the bot claims it
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const POLL_TIMEOUT_S = 50;
-const CLAUDE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min per job
-const MAX_QUEUE_PER_CHAT = 3;
-
 // ---------------------------------------------------------------------------
-// Logging
+// Logging (levels; never log tokens, prompts, proxy credentials)
 // ---------------------------------------------------------------------------
 
-function log(...args) {
-  console.log(new Date().toISOString(), '-', ...args);
+const DEBUG = /^(1|true|yes)$/i.test(process.env.BRIDGE_DEBUG || '');
+
+function logInfo(...args) {
+  console.log(new Date().toISOString(), '[info]', ...args);
 }
-
-// ---------------------------------------------------------------------------
-// Proxy resolution (no hard-coded endpoints; re-resolved on failure)
-// ---------------------------------------------------------------------------
-
-let currentAgent = null;
-let currentAgentLabel = 'direct';
-let needsReprobe = false;
-
-function readWindowsSystemProxy() {
-  if (process.platform !== 'win32') return null;
-  try {
-    const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
-    const out = require('child_process')
-      .execSync(`reg query "${key}" /v ProxyEnable & reg query "${key}" /v ProxyServer`, {
-        encoding: 'utf8',
-        timeout: 3000,
-      });
-    const enabled = /ProxyEnable\s+REG_DWORD\s+0x1/.test(out);
-    const server = (out.match(/ProxyServer\s+REG_SZ\s+(\S+)/) || [])[1];
-    if (!enabled || !server) return null;
-    if (server.includes(';')) {
-      const httpsPart = server.split(';').find((p) => p.toLowerCase().startsWith('https='));
-      if (httpsPart) server = httpsPart.split('=')[1];
-      else server = server.split(';')[0].split('=').pop();
-    }
-    let url = server.includes('://') ? server : `http://${server}`;
-    const u = new URL(url);
-    if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') return null; // local relays can't reach Telegram
-    return url;
-  } catch {
-    return null;
-  }
+function logWarn(...args) {
+  console.error(new Date().toISOString(), '[warn]', ...args);
 }
-
-function resolveProxyUrl() {
-  if (EXPLICIT_PROXY) return { url: EXPLICIT_PROXY, label: 'explicit (env)' };
-  const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy ||
-    process.env.ALL_PROXY || process.env.all_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
-  if (envProxy) return { url: envProxy, label: 'environment' };
-  const sysProxy = readWindowsSystemProxy();
-  if (sysProxy) return { url: sysProxy, label: 'windows system proxy' };
-  return null;
+function logError(...args) {
+  console.error(new Date().toISOString(), '[error]', ...args);
 }
-
-function makeAgent(proxyUrl) {
-  const u = new URL(proxyUrl);
-  if (u.protocol.startsWith('socks')) return new SocksProxyAgent(proxyUrl);
-  return new HttpsProxyAgent(proxyUrl);
-}
-
-function refreshAgent(reason) {
-  const found = resolveProxyUrl();
-  const agent = found ? makeAgent(found.url) : null;
-  const label = found ? `${found.url} [${found.label}]` : 'direct';
-  if (label !== currentAgentLabel) {
-    currentAgent = agent;
-    currentAgentLabel = label;
-    log(`proxy -> ${label}${reason ? ` (${reason})` : ''}`);
-  }
-  needsReprobe = false;
-}
-
-function agentForRequest() {
-  if (needsReprobe) refreshAgent('re-probe');
-  return { agent: currentAgent, label: currentAgentLabel };
-}
-
-function markConnectionFailure() {
-  needsReprobe = true; // next request re-reads env + registry (VPN may have started)
-}
-
-// ---------------------------------------------------------------------------
-// Telegram API
-// ---------------------------------------------------------------------------
-
-async function tgApi(method, params, attempt = 1) {
-  const { agent } = agentForRequest();
-  const maxAttempts = 6;
-  try {
-    const res = await fetch(`${API}/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(params || {}),
-      agent,
-      signal: AbortSignal.timeout(90_000),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.ok === false) {
-      const retryAfter = data.parameters && data.parameters.retry_after;
-      const desc = data.description || `HTTP ${res.status}`;
-      if (res.status === 429 && retryAfter) {
-        log(`rate limited on ${method}, waiting ${retryAfter}s`);
-        await sleep((retryAfter + 1) * 1000);
-        return tgApi(method, params, attempt);
-      }
-      throw new Error(`Telegram ${method} failed: ${desc}`);
-    }
-    return data.result;
-  } catch (err) {
-    const isNetwork = err && (err.cause || /fetch failed|network|ECONN|ETIMEDOUT|ENOTFOUND|socket/i.test(String(err.message || err)));
-    if (isNetwork && attempt < maxAttempts) {
-      markConnectionFailure();
-      const wait = Math.min(30, attempt * 5);
-      log(`network error on ${method} (attempt ${attempt}/${maxAttempts}), retrying in ${wait}s via ${currentAgentLabel}`);
-      await sleep(wait * 1000);
-      return tgApi(method, params, attempt + 1);
-    }
-    throw err;
-  }
-}
-
-async function sendChunk(agent, chatId, text) {
-  await tgApi('sendMessage', {
-    chat_id: chatId,
-    text,
-    parse_mode: 'Markdown',
-    disable_web_page_preview: true,
-  }).catch(async () => {
-    // Markdown parse errors: fall back to plain text
-    await tgApi('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true });
-  });
-  void agent;
-}
-
-async function reply(chatId, text) {
-  const { label } = agentForRequest();
-  const LIMIT = 3800;
-  let first = true;
-  for (let i = 0; i < text.length; i += LIMIT) {
-    let part = text.slice(i, i + LIMIT);
-    if (first && label !== 'direct' && i === 0) part = `[_via ${label}_]\n\n${part}`;
-    await sendChunk(currentAgent, chatId, part);
-    first = false;
-    if (i + LIMIT < text.length) await sleep(600);
-  }
+function logDebug(...args) {
+  if (DEBUG) console.log(new Date().toISOString(), '[debug]', ...args);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------------------------------------------------------------------------
-// Sessions (named, persistent, per chat)
-// ---------------------------------------------------------------------------
-
-function loadSessions() {
-  try {
-    return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-function saveSessions() {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
-}
-
-const sessions = loadSessions(); // chatId -> { active, list: {name -> sessionId} }
-
-function getChatState(chatId) {
-  if (!sessions[chatId]) sessions[chatId] = { active: 'default', list: {} };
-  return sessions[chatId];
+function failStartup(message) {
+  logError('refusing to start:', message);
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// Claude job queue (one claude process at a time, FIFO per arrival)
+// Configuration validation (fail closed, before anything else)
 // ---------------------------------------------------------------------------
 
-const queues = new Map(); // chatId -> array of jobs
-let running = false;
+const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_CLAUDE_BOT_TOKEN || '').trim();
 
-function enqueue(chatId, job) {
-  if (!queues.has(chatId)) queues.set(chatId, []);
-  const q = queues.get(chatId);
-  if (q.length >= MAX_QUEUE_PER_CHAT) {
-    reply(chatId, `⚠️ Queue is full (${MAX_QUEUE_PER_CHAT}). Wait for current jobs to finish.`);
-    return;
-  }
-  q.push(job);
-  reply(chatId, `📥 Queued at position ${q.length} for session *${job.sessionName}*. You'll get the report here.`);
-  drain();
+const tokenCheck = validateBotToken(BOT_TOKEN);
+if (!tokenCheck.ok) failStartup(tokenCheck.error);
+
+const allowCheck = parseAllowlist(process.env.ALLOWED_TELEGRAM_IDS);
+if (!allowCheck.ok) failStartup(`${allowCheck.error}. Set it to your numeric Telegram user ID(s) (comma-separated; get yours from @userinfobot). Claude runs with full machine access, so the bridge must know exactly who may talk to it.`);
+const ALLOWED = allowCheck.ids; // Set<string> — never logged or echoed
+
+const proxyCheck = validateProxyUrl(process.env.TELEGRAM_PROXY_URL);
+if (!proxyCheck.ok) failStartup(proxyCheck.error);
+const EXPLICIT_PROXY = proxyCheck.url || '';
+
+const timeoutCheck = intEnv(process.env.CLAUDE_TIMEOUT_MS, { name: 'CLAUDE_TIMEOUT_MS', def: 30 * 60 * 1000, min: 5000, max: 4 * 60 * 60 * 1000 });
+if (!timeoutCheck.ok) failStartup(timeoutCheck.error);
+const CLAUDE_TIMEOUT_MS = timeoutCheck.value;
+
+const queueLimitCheck = intEnv(process.env.MAX_QUEUE_PER_CHAT, { name: 'MAX_QUEUE_PER_CHAT', def: 3, min: 1, max: 100 });
+if (!queueLimitCheck.ok) failStartup(queueLimitCheck.error);
+const MAX_QUEUE_PER_CHAT = queueLimitCheck.value;
+
+const maxOutCheck = intEnv(process.env.MAX_STDOUT_BYTES, { name: 'MAX_STDOUT_BYTES', def: 512 * 1024, min: 1024, max: 8 * 1024 * 1024 });
+if (!maxOutCheck.ok) failStartup(maxOutCheck.error);
+const MAX_STDOUT_BYTES = maxOutCheck.value;
+
+const maxErrCheck = intEnv(process.env.MAX_STDERR_BYTES, { name: 'MAX_STDERR_BYTES', def: 64 * 1024, min: 1024, max: 1024 * 1024 });
+if (!maxErrCheck.ok) failStartup(maxErrCheck.error);
+const MAX_STDERR_BYTES = maxErrCheck.value;
+
+const dirCheck = ensureWritableDir(STATE_DIR);
+if (!dirCheck.ok) failStartup(dirCheck.error);
+
+const CLAUDE_BIN = (process.env.CLAUDE_BIN || 'claude').trim();
+const claudeCheck = resolveClaudeBin(CLAUDE_BIN);
+if (!claudeCheck.ok) failStartup(`${claudeCheck.error}. Set CLAUDE_BIN to the full path of the claude executable.`);
+const claudeDisplay = claudeCheck.resolved === 'claude' ? 'claude (on PATH)' : claudeCheck.resolved;
+
+const DEFAULT_CWD = (process.env.BRIDGE_CWD || ROOT).trim();
+if (!fs.existsSync(DEFAULT_CWD)) failStartup(`BRIDGE_CWD "${DEFAULT_CWD}" does not exist.`);
+
+// ---------------------------------------------------------------------------
+// Telegram client + session store
+// ---------------------------------------------------------------------------
+
+let tg = createTelegramClient({ token: BOT_TOKEN, explicitProxy: EXPLICIT_PROXY, log: logInfo });
+
+const store = createSessionStore(SESSIONS_FILE);
+
+// ---------------------------------------------------------------------------
+// Bounded stream capture (never let a chatty child consume memory)
+// ---------------------------------------------------------------------------
+
+function boundedCapture(limit) {
+  let buf = Buffer.alloc(0);
+  let truncated = false;
+  return {
+    push(chunk) {
+      const c = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (buf.length + c.length > limit) {
+        truncated = true;
+        const space = limit - buf.length;
+        if (space > 0) buf = Buffer.concat([buf, c.subarray(0, space)]);
+      } else {
+        buf = Buffer.concat([buf, c]);
+      }
+      // NOTE: we keep consuming; excess is discarded, so the child never blocks.
+    },
+    get text() {
+      return buf.toString('utf8');
+    },
+    get truncated() {
+      return truncated;
+    },
+  };
 }
 
-function drain() {
-  if (running) return;
-  const next = [...queues.entries()].find(([, q]) => q.length > 0);
-  if (!next) return;
-  running = true;
-  const [chatId, q] = next;
-  const job = q.shift();
-  runClaudeJob(chatId, job)
-    .catch((err) => reply(chatId, `❌ Job failed: ${err.message}`))
-    .finally(() => {
-      running = false;
-      setTimeout(drain, 300);
-    });
+// ---------------------------------------------------------------------------
+// Claude job execution (one-shot completion; spawn, never shell)
+// ---------------------------------------------------------------------------
+
+let currentRun = null; // { chatId, job, child, startedAt, cancelled, cancelReason } | null
+
+function buildClaudeArgs(job) {
+  // The user's text IS the prompt (-p <text>). Never built via a shell string.
+  const args = ['-p', job.text, '--output-format', 'text', '--dangerously-skip-permissions'];
+  // Session identity (job.sessionId) is fixed at enqueue time. The initialized
+  // flag may only advance, so we re-check it for this exact id just before spawn:
+  // an earlier queued job may have completed and made the session resumable.
+  const entry = store.get(job.chatId, job.sessionName);
+  const resumable = job.initialized || (entry && entry.id === job.sessionId && entry.initialized);
+  if (resumable) args.push('--resume', job.sessionId);
+  else args.push('--session-id', job.sessionId);
+  return args;
 }
 
-function runClaudeJob(chatId, job) {
+function runClaudeJob(chatId, job, { spawnFn = spawn } = {}) {
   return new Promise((resolve) => {
-    const st = getChatState(chatId);
-    const sessionId = st.list[job.sessionName];
-    const args = ['-p', '--output-format', 'text', '--dangerously-skip-permissions'];
-    if (sessionId) args.push('--resume', sessionId);
-    else args.push('--session-id', job.sessionId);
+    const args = buildClaudeArgs(job);
     const started = Date.now();
-    log(`job start chat=${chatId} session=${job.sessionName} resume=${!!sessionId}`);
+    logInfo(`job start chat=${chatId} session=${job.sessionName} id=${job.sessionId} resume=${args.includes('--resume')} bytes=${Buffer.byteLength(job.text, 'utf8')}`);
 
-    const child = spawn(CLAUDE_BIN, args, {
+    let finished = false;
+    let cancelled = false;
+    let cancelReason = null;
+    let timer = null;
+    let killTimer = null;
+
+    const stdoutCap = boundedCapture(MAX_STDOUT_BYTES);
+    const stderrCap = boundedCapture(MAX_STDERR_BYTES);
+
+    const child = spawnFn(claudeCheck.resolved, args, {
       cwd: job.cwd,
       env: process.env, // inherits ANTHROPIC_BASE_URL / provider relay config
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
       windowsHide: true,
     });
+    currentRun = { chatId, job, child, startedAt: started, cancelled: false, cancelReason: null };
 
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS);
-    child.stdout.on('data', (d) => (stdout += d.toString()));
-    child.stderr.on('data', (d) => (stderr += d.toString()));
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reply(chatId, `❌ Could not launch claude CLI: ${err.message}`);
-      resolve();
-    });
-    child.on('close', async (code) => {
-      clearTimeout(timer);
-      const secs = Math.round((Date.now() - started) / 1000);
-      log(`job done chat=${chatId} code=${code} in ${secs}s out=${stdout.length}B`);
-      let header = `🤖 *${job.sessionName}* — done in ${secs}s`;
-      if (code !== 0) header += ` (exit ${code})`;
-      let body = stdout.trim();
-      if (!body && stderr.trim()) body = `stderr:\n${stderr.trim().slice(0, 3000)}`;
-      if (!body) body = '_(no output)_';
+    function cancel(reason) {
+      if (finished || cancelled) return;
+      cancelled = true;
+      cancelReason = reason;
+      currentRun.cancelled = true;
+      currentRun.cancelReason = reason;
       try {
-        await reply(chatId, `${header}\n\n${body}`);
-      } catch (err) {
-        log('failed to deliver report:', err.message);
+        child.kill('SIGTERM');
+      } catch {
+        /* ignore */
       }
-      resolve();
+      killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }, 5000);
+      if (killTimer.unref) killTimer.unref();
+    }
+    currentRun.cancel = cancel; // /stop uses this to cancel the active job
+
+    function finishOnce(reportFn) {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      reportFn();
+    }
+
+    timer = setTimeout(() => cancel('timeout'), CLAUDE_TIMEOUT_MS);
+    if (timer.unref) timer.unref();
+
+    child.stdout.on('data', (d) => stdoutCap.push(d));
+    child.stderr.on('data', (d) => stderrCap.push(d));
+
+    // Spawn failures (ENOENT etc.) — 'close' may or may not follow; the guard
+    // ensures whichever arrives first completes the job exactly once.
+    child.on('error', (err) => {
+      finishOnce(() => {
+        logError(`job spawn error chat=${chatId}:`, err.message);
+        currentRun = null;
+        resolve();
+        reply(chatId, `❌ Could not run Claude (${claudeDisplay}): ${err.message}`).catch(() => {});
+      });
+    });
+
+    child.on('close', (code, signal) => {
+      finishOnce(async () => {
+        const secs = Math.round((Date.now() - started) / 1000);
+        logInfo(`job done chat=${chatId} session=${job.sessionName} code=${code} signal=${signal || '-'} in ${secs}s out=${stdoutCap.text.length}B`);
+        currentRun = null;
+
+        if (code === 0 && !cancelled) {
+          // Session is now real on Claude's side; future jobs resume it.
+          store.markInitialized(chatId, job.sessionId);
+          store.save();
+        }
+
+        let header;
+        if (cancelled) {
+          header = `🛑 *${job.sessionName}* — job cancelled (${cancelReason}) after ${secs}s`;
+        } else {
+          header = `🤖 *${job.sessionName}* — done in ${secs}s`;
+          if (code !== 0) header += ` (exit ${code})`;
+        }
+
+        let body = stdoutCap.text.trim();
+        if (!body && stderrCap.text.trim()) body = `stderr:\n${stderrCap.text.trim()}`;
+        if (stdoutCap.truncated) body += `\n\n_(stdout truncated at ${MAX_STDOUT_BYTES} bytes)_`;
+        if (stderrCap.truncated) body += `\n\n_(stderr truncated at ${MAX_STDERR_BYTES} bytes)_`;
+        if (!body.trim() || body.trim() === 'stderr:') body = '_(no output)_';
+
+        try {
+          await reply(chatId, `${header}\n\n${body}`);
+        } catch (err) {
+          logError('failed to deliver report:', err.message);
+        }
+        resolve();
+      });
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Job queue (global FIFO across chats)
+// ---------------------------------------------------------------------------
+
+const claudeRunner = { run: (chatId, job) => runClaudeJob(chatId, job) }; // swappable for tests
+
+const queue = createJobQueue({
+  maxPerChat: MAX_QUEUE_PER_CHAT,
+  runJob: (chatId, job) => claudeRunner.run(chatId, job),
+});
+
+// ---------------------------------------------------------------------------
+// Telegram sends (centralized, chunked, safe)
+// ---------------------------------------------------------------------------
+
+const CHUNK_LIMIT = 3800;
+
+async function sendChunk(chatId, text) {
+  try {
+    await tg.request('sendMessage', {
+      chat_id: chatId,
+      text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+    });
+  } catch {
+    // Markdown parse errors: fall back to plain text.
+    try {
+      await tg.request('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true });
+    } catch (err2) {
+      logWarn(`sendMessage to chat ${chatId} failed: ${err2.message}`);
+    }
+  }
+}
+
+/** Chunked reply; never throws (failures are logged). */
+async function reply(chatId, text) {
+  const { label, source } = tg.state();
+  const full = label !== 'direct' && source
+    ? `[_proxy: ${label}_]\n\n${text}`
+    : text;
+  for (let i = 0; i < full.length; i += CHUNK_LIMIT) {
+    await sendChunk(chatId, full.slice(i, i + CHUNK_LIMIT));
+    if (i + CHUNK_LIMIT < full.length) await sleep(400);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status helpers
+// ---------------------------------------------------------------------------
+
+function formatUptime(s) {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${Math.floor(s)}s`;
+}
+
+function statusText(chatId) {
+  const { label, source } = tg.state();
+  const active = store.active(chatId);
+  const info = queue.info(chatId);
+  const runningMine = currentRun && currentRun.chatId === chatId
+    ? `*${currentRun.job.sessionName}* (${Math.round((Date.now() - currentRun.startedAt) / 1000)}s${currentRun.cancelled ? ', cancelling…' : ''})`
+    : (currentRun ? `busy with another chat's job` : 'none');
+  return [
+    `Claude: *${claudeDisplay}*`,
+    `Active session: *${active.name}* (${active.session.initialized ? 'initialized' : 'new'})`,
+    `Running job: ${runningMine}`,
+    `Queue: ${info.mineQueued} in this chat, ${info.totalQueued} total`,
+    `Proxy: *${label}* [${source || 'direct'}]`,
+    `Uptime: ${formatUptime(process.uptime())}`,
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
 // Message handling
 // ---------------------------------------------------------------------------
 
-function randomSessionId() {
-  return require('crypto').randomUUID();
-}
-
-function helpText(openAccess) {
-  const title = botUsername ? `*@${botUsername}* — Claude Code bridge` : '*Claude Code bridge*';
-  return [
-    `${title} — drive your local Claude Code harness from Telegram.`,
-    '',
-    '`/new <name>` — start a fresh named session (then just type tasks)',
-    '`/sessions` — list sessions and the active one',
-    '`/use <name>` — switch active session',
-    '`/stop` — cancel the queued job(s) for this chat',
-    '`/status` — proxy + queue status',
-    '',
-    'Any other text is sent to the active session as a task; the final report comes back here.',
-    openAccess ? '\n⚠️ No ALLOWED_TELEGRAM_IDS set — the first person who messages claims this bot.' : '',
-  ].join('\n');
-}
-
 let botUsername = '';
 
 async function handleMessage(msg) {
-  const chatId = String(msg.chat.id);
-  const userId = String(msg.from && msg.from.id);
-  const text = (msg.text || '').trim();
+  const chatId = String(msg.chat && msg.chat.id);
+  const userId = String((msg.from && msg.from.id) || '');
 
-  if (!OPEN_ACCESS && !ALLOWED.has(userId)) {
-    log(`rejected user ${userId} in chat ${chatId}`);
+  // Fail closed: unknown users are ignored entirely (no capability probing).
+  if (!ALLOWED.has(userId)) {
+    logInfo(`rejected unauthorized user=${userId} chat=${chatId}`);
     return;
   }
-  if (OPEN_ACCESS) {
-    ALLOWED.add(userId);
-    log(`OPEN_ACCESS: user ${userId} claimed the bot`);
+
+  if (typeof msg.text !== 'string' || !msg.text.trim()) {
+    logDebug(`chat=${chatId}: ignoring non-text message type`);
+    return; // media/ stickers/ etc. intentionally unsupported
   }
+  const text = msg.text.trim();
+  logInfo(`msg from user=${userId} chat=${chatId} len=${text.length}`);
 
-  log(`msg from ${userId} chat=${chatId}: ${text.slice(0, 80).replace(/\n/g, ' ')}`);
-
-  if (text.startsWith('/')) {
-    const [cmd, ...rest] = text.split(/\s+/);
-    const arg = rest.join(' ').trim();
-    const st = getChatState(chatId);
-    switch (cmd) {
-      case '/start':
-      case '/help':
-        await reply(chatId, helpText(OPEN_ACCESS));
-        return;
-      case '/new': {
-        const name = (arg || `s-${Date.now().toString(36)}`).replace(/[^\w-]/g, '-').slice(0, 32);
-        st.list[name] = randomSessionId();
-        st.active = name;
-        saveSessions();
-        await reply(chatId, `✨ New session *${name}* created and active. Send me your first task.`);
-        return;
-      }
-      case '/use': {
-        if (st.list[arg]) {
-          st.active = arg;
-          saveSessions();
-          await reply(chatId, `🔀 Switched to *${arg}*.`);
-        } else {
-          await reply(chatId, `No session named *${arg}*.`);
-        }
-        return;
-      }
-      case '/sessions': {
-        const lines = Object.keys(st.list).map((n) => `${n === st.active ? '▶️' : '  '} *${n}*`);
-        await reply(chatId, lines.length ? `Sessions:\n${lines.join('\n')}` : 'No sessions yet. Use /new <name>.');
-        return;
-      }
-      case '/stop': {
-        const q = queues.get(chatId);
-        if (arg && st.list[arg] && st.active === arg) {
-          await reply(chatId, `Session *${arg}* is the active session; it will stop after the current job. Use /new to replace it.`);
-        } else if (q && q.length) {
-          q.length = 0;
-          await reply(chatId, '🛑 Queued jobs cleared. (A job already running cannot be interrupted safely.)');
-        } else {
-          await reply(chatId, 'Nothing queued right now.');
-        }
-        return;
-      }
-      case '/status': {
-        const { label } = agentForRequest();
-        const q = queues.get(chatId) || [];
-        await reply(chatId, `Proxy: *${label}*\nQueue: ${q.length} job(s)\nActive session: *${st.active}*`);
-        return;
-      }
-      default:
-        await reply(chatId, helpText(OPEN_ACCESS));
-        return;
+  const parsed = parseCommand(text);
+  if (parsed) {
+    // Group-style "/cmd@SomeBot": ignore commands addressed to other bots.
+    if (parsed.addressedTo && botUsername && parsed.addressedTo.toLowerCase() !== botUsername.toLowerCase()) {
+      logDebug(`ignoring command addressed to @${parsed.addressedTo}`);
+      return;
     }
+    await dispatchCommand(chatId, parsed);
+    return;
   }
 
-  if (!text) return;
+  // Plain text => task for the active session.
+  const active = store.active(chatId);
+  const job = {
+    sessionName: active.name,
+    sessionId: active.session.id,
+    initialized: active.session.initialized,
+    text, // exact Telegram text, multiline preserved; passed as spawn arg
+    cwd: DEFAULT_CWD,
+    chatId,
+  };
+  const res = queue.enqueue(chatId, job, {
+    onQueued: (position) => {
+      reply(chatId, `📥 Queued at position ${position} for session *${job.sessionName}*. You'll get the report here.`);
+    },
+    onRejected: (max) => {
+      reply(chatId, `⚠️ Queue is full for this chat (${max} waiting). Use /stop to clear or wait for jobs to finish.`);
+    },
+  });
+  if (!res.ok) logWarn(`enqueue rejected chat=${chatId}`);
+}
 
-  const st = getChatState(chatId);
-  const sessionName = st.active;
-  if (!st.list[sessionName]) {
-    st.list[sessionName] = randomSessionId();
-    saveSessions();
+async function dispatchCommand(chatId, parsed) {
+  const { cmd, arg } = parsed;
+  switch (cmd) {
+    case 'start':
+    case 'help':
+      await reply(chatId, helpText(botUsername));
+      return;
+
+    case 'new': {
+      const created = store.create(chatId, arg);
+      if (!created.ok) {
+        await reply(chatId, `❌ ${created.error}`);
+        return;
+      }
+      store.save();
+      await reply(chatId, `✨ New session *${created.name}* created and active. Send me your first task.`);
+      return;
+    }
+
+    case 'sessions': {
+      const names = store.names(chatId);
+      const active = store.active(chatId);
+      if (!names.length) {
+        await reply(chatId, 'No sessions yet. Use /new <name>.');
+        return;
+      }
+      const lines = names.map((n) => {
+        const s = store.get(chatId, n);
+        const flag = n === active.name ? '▶️' : '  ';
+        return `${flag} *${n}*${s.initialized ? '' : ' (new)'}`;
+      });
+      await reply(chatId, `Sessions:\n${lines.join('\n')}`);
+      return;
+    }
+
+    case 'use': {
+      if (!arg) {
+        await reply(chatId, 'Usage: /use <name>');
+        return;
+      }
+      const res = store.setActive(chatId, arg);
+      if (!res.ok) {
+        await reply(chatId, `No session named *${arg}*. Use /sessions to list.`);
+        return;
+      }
+      store.save();
+      await reply(chatId, `🔀 Switched to *${arg}*.`);
+      return;
+    }
+
+    case 'stop': {
+      const removed = queue.clearChat(chatId);
+      let cancelNote = 'no running job in this chat';
+      if (currentRun && currentRun.chatId === chatId && !currentRun.cancelled) {
+        currentRun.cancel('stopped by /stop');
+        cancelNote = `running job *${currentRun.job.sessionName}* cancelled`;
+      }
+      await reply(chatId, `🛑 ${cancelNote}; ${removed} queued job(s) removed.`);
+      return;
+    }
+
+    case 'queue': {
+      const info = queue.info(chatId);
+      const parts = [];
+      parts.push(info.running
+        ? `Running: *${info.running.sessionName}*${currentRun && currentRun.chatId === chatId ? '' : ' (other chat)'}`
+        : 'Running: none');
+      parts.push(`Queued in this chat: ${info.mineQueued}`);
+      parts.push(`Global queued: ${info.totalQueued}`);
+      await reply(chatId, parts.join('\n'));
+      return;
+    }
+
+    case 'status':
+      await reply(chatId, statusText(chatId));
+      return;
+
+    default:
+      // Unknown command (not in BOT_COMMANDS): show help.
+      await reply(chatId, helpText(botUsername));
+      return;
   }
-  enqueue(chatId, { sessionName, sessionId: st.list[sessionName], text, cwd: DEFAULT_CWD });
 }
 
 // ---------------------------------------------------------------------------
-// Long polling loop
+// Long polling (durable offset; one malformed update never blocks the loop)
 // ---------------------------------------------------------------------------
 
+function readOffset() {
+  try {
+    const v = parseInt(fs.readFileSync(OFFSET_FILE, 'utf8').trim(), 10);
+    return Number.isSafeInteger(v) && v >= 0 ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeOffset(offset) {
+  try {
+    const tmp = `${OFFSET_FILE}.tmp`;
+    fs.writeFileSync(tmp, String(offset));
+    fs.renameSync(tmp, OFFSET_FILE);
+  } catch (err) {
+    logWarn('failed to persist offset:', err.message);
+  }
+}
+
 async function pollLoop() {
-  let offset = 0;
-  while (true) {
+  let offset = readOffset();
+  while (!shuttingDown) {
     try {
-      const updates = await tgApi('getUpdates', {
+      const updates = await tg.request('getUpdates', {
         offset,
-        timeout: POLL_TIMEOUT_S,
+        timeout: 50,
         allowed_updates: ['message'],
       });
       for (const upd of updates || []) {
-        offset = upd.update_id + 1;
-        if (upd.message) handleMessage(upd.message).catch((e) => log('handler error:', e.message));
+        offset = Math.max(offset, upd.update_id + 1);
+        writeOffset(offset); // consume before handling: no re-execution after restart
+        try {
+          if (upd.message) await handleMessage(upd.message);
+        } catch (err) {
+          logError('handler error:', err.message);
+        }
       }
     } catch (err) {
-      markConnectionFailure();
-      log('poll error:', err.message || err, '— retrying in 10s');
+      if (shuttingDown) break;
+      tg.markFailure();
+      logWarn('poll error:', err.message, '— retrying in 10s');
       await sleep(10_000);
     }
   }
+  logInfo('polling stopped');
 }
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+let shuttingDown = false;
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logInfo(`${signal} received, shutting down…`);
+  if (currentRun && currentRun.child && currentRun.child.exitCode === null) {
+    try {
+      currentRun.child.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+    setTimeout(() => {
+      try {
+        if (currentRun && currentRun.child.exitCode === null) currentRun.child.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+    }, 3000);
+  }
+  queue.close();
+  Promise.race([store.flush(), sleep(3000)]).then(() => {
+    logInfo('bye');
+    process.exit(0);
+  });
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 
-(async () => {
-  if (!BOT_TOKEN) {
-    console.error('Missing TELEGRAM_BOT_TOKEN. Put it in .env next to bridge.js');
-    process.exit(1);
-  }
-  refreshAgent('startup');
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+if (require.main === module) (async () => {
+  logInfo(`starting bridge; claude=${claudeDisplay}; state dir=${STATE_DIR}`);
+  logInfo(`allowlist: ${ALLOWED.size} authorized user(s)`);
 
   let me = null;
   while (!me) {
     try {
-      me = await tgApi('getMe', {});
+      me = await tg.request('getMe', {});
     } catch (err) {
-      log('cannot reach Telegram yet:', err.message || err, '— start your VPN; retrying in 15s');
+      logWarn('cannot reach Telegram yet:', err.message, '— start your VPN; retrying in 15s');
       await sleep(15_000);
     }
   }
   botUsername = me.username || '';
-  log(`authorized as @${botUsername}. Proxy: ${currentAgentLabel}`);
-  log(`access: ${OPEN_ACCESS ? 'OPEN (first user claims)' : `allowlist [${[...ALLOWED].join(', ')}]`}`);
-  log('listening for messages… (Ctrl+C to stop)');
+  const { label, source } = tg.state();
+  logInfo(`authorized as @${botUsername}. Proxy: ${label} [${source || 'direct'}]`);
+  logInfo('listening for messages… (Ctrl+C to stop)');
 
-  setInterval(() => { needsReprobe = true; }, 60_000); // periodically notice VPN changes even without failures
-  pollLoop();
-})();
+  // Register slash-command autocomplete / menu (non-fatal on failure).
+  try {
+    await tg.request('setMyCommands', { commands: BOT_COMMANDS });
+    logInfo(`registered ${BOT_COMMANDS.length} bot commands with Telegram`);
+  } catch (err) {
+    logWarn('setMyCommands failed (bridge continues):', err.message);
+  }
+  try {
+    await tg.request('setChatMenuButton', { menu_button: { type: 'commands' } });
+  } catch (err) {
+    logWarn('setChatMenuButton failed (bridge continues):', err.message);
+  }
+
+  // Periodically re-resolve the proxy so VPN changes are noticed even without errors.
+  const reprobe = setInterval(() => {
+    if (!shuttingDown) tg.refresh('periodic');
+  }, 60_000);
+  if (reprobe.unref) reprobe.unref();
+
+  await pollLoop();
+})().catch((err) => {
+  logError('fatal:', err.message || err);
+  process.exit(1);
+});
+
+// Exported for tests; no side effects beyond config validation at require time.
+module.exports = {
+  __test: {
+    handleMessage,
+    dispatchCommand,
+    buildClaudeArgs,
+    boundedCapture,
+    statusText,
+    runClaudeJob,
+    store,
+    queue,
+    claudeRunner,
+    setTelegram(fake) {
+      tg = fake; // tests inject a no-network client
+    },
+    getTelegram: () => tg,
+    STATE_DIR,
+  },
+};
