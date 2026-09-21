@@ -50,6 +50,8 @@ loadEnvFile();
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_CLAUDE_BOT_TOKEN || '';
 const EXPLICIT_PROXY = process.env.TELEGRAM_PROXY_URL || '';
+const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'; // claude executable if not on PATH
+const DEFAULT_CWD = process.env.BRIDGE_CWD || ROOT;    // where Claude jobs run
 const ALLOWED = new Set(
   (process.env.ALLOWED_TELEGRAM_IDS || '')
     .split(',')
@@ -276,9 +278,9 @@ function runClaudeJob(chatId, job) {
     const started = Date.now();
     log(`job start chat=${chatId} session=${job.sessionName} resume=${!!sessionId}`);
 
-    const child = spawn('claude', args, {
+    const child = spawn(CLAUDE_BIN, args, {
       cwd: job.cwd,
-      env: process.env, // inherits ANTHROPIC_BASE_URL / agentrouter / omniroute config
+      env: process.env, // inherits ANTHROPIC_BASE_URL / provider relay config
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -321,8 +323,9 @@ function randomSessionId() {
 }
 
 function helpText(openAccess) {
+  const title = botUsername ? `*@${botUsername}* — Claude Code bridge` : '*Claude Code bridge*';
   return [
-    '*ShiClaude bridge* — talk to your local Claude Code harness.',
+    `${title} — drive your local Claude Code harness from Telegram.`,
     '',
     '`/new <name>` — start a fresh named session (then just type tasks)',
     '`/sessions` — list sessions and the active one',
@@ -417,7 +420,7 @@ async function handleMessage(msg) {
     st.list[sessionName] = randomSessionId();
     saveSessions();
   }
-  enqueue(chatId, { sessionName, sessionId: st.list[sessionName], text, cwd: ROOT });
+  enqueue(chatId, { sessionName, sessionId: st.list[sessionName], text, cwd: DEFAULT_CWD });
 }
 
 // ---------------------------------------------------------------------------

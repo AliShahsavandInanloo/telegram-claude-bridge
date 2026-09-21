@@ -1,7 +1,8 @@
-# ShiClaude — Telegram ↔ Claude Code Bridge — Documentation
+# Telegram ↔ Claude Code Bridge — Documentation
 
 A self-hosted bridge that lets you drive a local **Claude Code** harness from
-**Telegram**. You send tasks to your bot (`@ShiClaude_bot`), they are executed by
+**Telegram**. You send tasks to **your own bot** (any name you registered with
+@BotFather), they are executed by
 `claude` on this machine, and the final report is delivered back to your chat.
 
 It is built specifically for **censored networks** (countries where Telegram is
@@ -20,7 +21,7 @@ blocked): all bot traffic can flow through any VPN/proxy you run on Windows, and
 6. [Telegram commands](#6-telegram-commands)
 7. [Sessions explained](#7-sessions-explained)
 8. [Proxy & censorship handling](#8-proxy--censorship-handling)
-9. [Model provider (agentrouter / omniroute)](#9-model-provider-agentrouter--omniroute)
+9. [Model provider & relays](#9-model-provider--relays)
 10. [Security model](#10-security-model)
 11. [Configuration reference (.env)](#11-configuration-reference-env)
 12. [Troubleshooting](#12-troubleshooting)
@@ -39,7 +40,7 @@ blocked): all bot traffic can flow through any VPN/proxy you run on Windows, and
         ▼                                      ▼                            ▼
   blocked locally —                    auto-detected proxy:          reads your own
   all traffic goes via                 env vars → Windows            ~/.claude/settings.json
-  your VPN/proxy                       registry → direct             (agentrouter relay)
+  your VPN/proxy                       registry → direct             (your model relay)
 ```
 
 The message lifecycle:
@@ -63,10 +64,11 @@ Hard timeout per job: **30 minutes** (process killed, exit code reported).
 ## 2. Project layout
 
 ```
-I:\Claude\telegram-claude-bridge\
+<bridge folder>
 ├── bridge.js            # the entire bridge (single file, no build step)
 ├── package.json         # deps: https-proxy-agent, socks-proxy-agent
-├── .env                 # bot token, allowlist, optional proxy (gitignored)
+├── .env                 # your real config (gitignored — token lives here)
+├── .env.example         # commit-safe template to copy from
 ├── .gitignore
 ├── start-bridge.cmd     # double-click launcher (Windows)
 ├── README.md            # quick-start
@@ -80,12 +82,13 @@ I:\Claude\telegram-claude-bridge\
 
 ## 3. Requirements
 
-| Component | Status on this machine |
+| Component | Requirement |
 |---|---|
-| Node.js ≥ 18 | ✅ v22.23.1 |
-| Claude Code CLI (`claude`) | ✅ v2.1.267 (`C:\Users\ali\.local\bin\claude.exe`) |
-| Working model backend | ✅ your agentrouter/omniroute relay on `localhost:20128` |
-| VPN / proxy for Telegram | needed only when Telegram is blocked (it is) |
+| Node.js | ≥ 18 (v22 tested) |
+| Claude Code CLI (`claude`) | installed and on PATH (`claude -p "hi"` works); else set `CLAUDE_BIN` |
+| Working model backend | whatever your `claude` is configured for (Anthropic, or a relay via `ANTHROPIC_BASE_URL`) |
+| VPN / proxy for Telegram | needed only where Telegram is blocked |
+| A Telegram bot | create one with @BotFather, any name |
 
 Check headless Claude any time:
 
@@ -93,22 +96,24 @@ Check headless Claude any time:
 claude -p "Reply with exactly: BRIDGE_TEST_OK"
 ```
 
-> The log line `[claude-code:unrecognized_model] …agentrouter/deepseek-v4-flash`
-> is a harmless warning — the model still answers through your relay.
+> Warnings like `[claude-code:unrecognized_model]` for custom model names
+> (e.g. `provider/my-model`) are harmless — the model still answers through
+> your configured backend.
 
 ---
 
 ## 4. One-time setup
 
 ```cmd
-cd /d I:\Claude\telegram-claude-bridge
+git clone https://github.com/AliShahsavandInanloo/telegram-claude-bridge.git
+cd telegram-claude-bridge
 npm install
+copy .env.example .env
 ```
 
 Then edit `.env`:
 
-1. **`TELEGRAM_BOT_TOKEN`** — already written from your environment (46-char
-   token from @BotFather for `@ShiClaude_bot`). Keep it secret.
+1. **`TELEGRAM_BOT_TOKEN`** — from @BotFather for **your** bot. Keep it secret.
 2. **`ALLOWED_TELEGRAM_IDS`** — your numeric Telegram user ID(s), comma
    separated. Get it from **@userinfobot**. Leave empty only for first
    claiming (see [Security](#10-security-model)).
@@ -122,7 +127,7 @@ Then edit `.env`:
 **Option B — terminal:**
 
 ```cmd
-cd /d I:\Claude\telegram-claude-bridge
+cd telegram-claude-bridge
 node bridge.js
 ```
 
@@ -130,7 +135,7 @@ Expected startup (VPN already on):
 
 ```
 … - proxy -> 127.0.0.1:10809 [windows system proxy]
-… - authorized as @ShiClaude_bot. Proxy: …
+… - authorized as @YourBot. Proxy: …
 … - access: allowlist [123456789]
 … - listening for messages… (Ctrl+C to stop)
 ```
@@ -156,12 +161,12 @@ every attempt — turn the VPN on whenever, the bridge joins on its own.
 Example conversation:
 
 ```
-you:    /new nds-indicator
-bot:    ✨ New session *nds-indicator* created and active. Send me your first task.
-you:    analyze the fractal indicator code in I:\Claude\NDS Indicator and
-        summarize what the entry logic does
-bot:    📥 Queued at position 1 for session *nds-indicator*…
-bot:    🤖 *nds-indicator* — done in 74s
+you:    /new my-app
+bot:    ✨ New session *my-app* created and active. Send me your first task.
+you:    summarize the parser code in C:\dev\my-app and
+        explain what the entry logic does
+bot:    📥 Queued at position 1 for session *my-app*…
+bot:    🤖 *my-app* — done in 74s
         The entry logic works in three stages: …
 ```
 
@@ -177,10 +182,9 @@ bot:    🤖 *nds-indicator* — done in 74s
 - `state/sessions.json` maps names to UUIDs — **don't delete it** if you want
   to keep context. Deleting a line there simply makes the next task start a
   fresh conversation.
-- The bridge folder (`I:\Claude\telegram-claude-bridge`) is the working
-  directory for every job, so relative paths and tool permissions resolve
-  there. Claude can still read/edit elsewhere via absolute paths
-  (`I:\Claude\NDS Indicator\...`) since permissions are skipped.
+- The working directory for every job is `BRIDGE_CWD` if set in `.env`,
+  otherwise the bridge folder. Claude can still read/edit elsewhere via
+  absolute paths since permissions are skipped.
 - A running job **cannot be interrupted** safely: killing `claude --resume`
   mid-flight risks corrupting the session. `/stop` clears the queue instead.
 
@@ -233,20 +237,20 @@ curl.exe -s -m 8 -x http://127.0.0.1:10809 https://api.telegram.org/ -o NUL -w "
 
 ---
 
-## 9. Model provider (agentrouter / omniroute)
+## 9. Model provider & relays
 
 The bridge **never touches provider config**. It spawns `claude` with your
-full environment, so Claude Code reads your own
-`C:\Users\ali\.claude\settings.json`:
+full environment, so Claude Code reads your own `~/.claude/settings.json`
+(`%USERPROFILE%\.claude\settings.json` on Windows):
 
-- `ANTHROPIC_BASE_URL = http://localhost:20128` → your local omniroute relay
-- model mappings → `agentrouter/deepseek-v4-flash` etc.
+- `ANTHROPIC_BASE_URL` pointing at any relay (a local router, a gateway, etc.)
+- any custom model mappings (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`)
 
 Consequences:
 
-- No Anthropic API key is needed or used.
-- If the relay on port 20128 is down, jobs fail with a provider error —
-  start your router first.
+- No Anthropic API key is needed when your backend supplies its own auth.
+- If your model backend/relay is down, jobs fail with a provider error —
+  start it first.
 - To change models, change your own settings as usual; the bridge follows.
 
 ---
@@ -277,6 +281,8 @@ Treat every message you send to the bot as a shell command on this machine:
 | `TELEGRAM_BOT_TOKEN` | yes | — | from @BotFather; falls back to env `TELEGRAM_CLAUDE_BOT_TOKEN` |
 | `ALLOWED_TELEGRAM_IDS` | recommended | *(empty)* | comma-separated user IDs; empty = first user claims |
 | `TELEGRAM_PROXY_URL` | no | auto | explicit proxy for Telegram traffic |
+| `CLAUDE_BIN` | no | `claude` | full path to the claude executable if not on PATH |
+| `BRIDGE_CWD` | no | bridge folder | working directory for Claude jobs |
 
 Other tunables live as constants at the top of `bridge.js`:
 `POLL_TIMEOUT_S` (50), `CLAUDE_TIMEOUT_MS` (30 min), `MAX_QUEUE_PER_CHAT` (3),
@@ -292,8 +298,8 @@ reply chunk size (3,800), re-probe interval (60 s).
 | `Telegram getMe failed: 401` | wrong token in `.env` → re-copy from @BotFather |
 | `Telegram getMe failed: 404` | token malformed → re-copy, keep the `:` and digits |
 | Bot silent, no logs of messages | someone else claimed the bot (open-access run) → set allowlist and restart |
-| `❌ Could not launch claude CLI` | `claude` not on PATH → it's at `C:\Users\ali\.local\bin\claude.exe` |
-| Job fails instantly with provider error | omniroute relay on 20128 down → start it |
+| `❌ Could not launch claude CLI` | `claude` not on PATH → set `CLAUDE_BIN` in `.env` to the full executable path |
+| Job fails instantly with provider error | your model backend/relay is down → start it |
 | Report says `(exit 124)` / timeout | job hit the 30-min cap → split the task smaller |
 | Reply shows raw `*text*` | Markdown fallback kicked in — cosmetic only |
 | Multiple `(_via …_)` prefixes differ | proxy changed mid-session; the tag shows the route used for the first chunk |
@@ -305,8 +311,8 @@ Diagnostics cheat sheet:
 :: 1. Claude headless works?
 claude -p "say ok"
 
-:: 2. Relay up?
-curl -s -m 5 http://localhost:20128/ -o NUL -w "%{http_code}"
+:: 2. Model backend/relay up? (use the address from your ANTHROPIC_BASE_URL)
+curl -s -m 5 http://localhost:<relay-port>/ -o NUL -w "%{http_code}"
 
 :: 3. Telegram reachable (some line must print 200)?
 curl.exe -s -m 8 https://api.telegram.org/ -o NUL -w "%{http_code}"

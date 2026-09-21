@@ -1,8 +1,8 @@
-# ShiClaude — Telegram ↔ Claude Code bridge
+# Telegram ↔ Claude Code bridge
 
-Chat with your local Claude Code harness from Telegram. Built for censored networks:
-Telegram is banned locally, so all bot traffic can flow through whatever VPN/proxy
-you run on Windows. **No proxies are hard-coded** — the bridge auto-detects:
+Chat with a local **Claude Code** harness from any Telegram bot you own. Built for
+censored networks: where Telegram is banned, bot traffic can flow through whatever
+VPN/proxy you run. **Nothing is hard-coded** — the bridge auto-detects the route:
 
 1. `TELEGRAM_PROXY_URL` in `.env` (optional explicit override)
 2. `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` environment variables
@@ -12,22 +12,31 @@ you run on Windows. **No proxies are hard-coded** — the bridge auto-detects:
 It re-checks whenever a request fails (and every 60 s), so you can start/stop your
 VPN whenever you like and the bridge recovers on its own.
 
-Your agentrouter/omniroute model routing is untouched: the bridge just spawns the
-`claude` CLI, which reads your own `~/.claude/settings.json` (`ANTHROPIC_BASE_URL`
-→ your local omniroute relay on port 20128). Anthropic keys are never needed.
+Your model provider setup is untouched: the bridge just spawns the `claude` CLI,
+which reads your own `~/.claude/settings.json` (any `ANTHROPIC_BASE_URL` relay,
+custom model mappings, etc. all keep working). Works with any user and any bot —
+the bot's name shown in help text is fetched from Telegram at runtime.
 
 ## One-time setup
 
 ```cmd
-cd /d I:\Claude\telegram-claude-bridge
+git clone https://github.com/AliShahsavandInanloo/telegram-claude-bridge.git
+cd telegram-claude-bridge
 npm install
+copy .env.example .env
 ```
 
-Edit `.env`:
+(Linux/macOS: `cp .env.example .env`)
 
-- `TELEGRAM_BOT_TOKEN` — from @BotFather for **@ShiClaude_bot**
+Then edit `.env`:
+
+- `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather) for **your** bot
 - `ALLOWED_TELEGRAM_IDS` — your numeric Telegram user ID(s), comma-separated
-  (get it from @userinfobot; leave empty to let the first person who messages claim the bot — not recommended)
+  (get it from @userinfobot; leave empty to let the first person who messages claim
+  the bot — not recommended, see Security in the docs)
+
+Optional: `TELEGRAM_PROXY_URL` (pin a proxy), `CLAUDE_BIN` (claude not on PATH),
+`BRIDGE_CWD` (where Claude jobs run).
 
 ## Run
 
@@ -52,15 +61,17 @@ Startup log lines show the authorized bot name, chosen proxy route, and access m
 
 Sessions are persistent (UUID-backed, resumed via `claude --resume`), so context
 survives bridge restarts. Each message runs as one `claude -p` job with
-`--dangerously-skip-permissions` in the bridge folder — treat the bot as someone
-with full access to this machine: keep `ALLOWED_TELEGRAM_IDS` set to you only.
+`--dangerously-skip-permissions` in the configured working directory — treat the
+bot as someone with full access to this machine: keep `ALLOWED_TELEGRAM_IDS` set
+to you only.
 
 ## Troubleshooting
 
 - `poll error: fetch failed` repeating → your VPN is off; turn it on, the bridge
   re-probes within 10 s. Or set `TELEGRAM_PROXY_URL` explicitly.
 - 401 from Telegram → wrong `TELEGRAM_BOT_TOKEN`.
-- Job outputs nothing → check that `claude -p "hi"` works in a terminal.
+- Job outputs nothing → check that `claude -p "hi"` works in a terminal; set
+  `CLAUDE_BIN` if `claude` isn't on PATH.
 - Large replies are split into chunks; Markdown that fails to parse is re-sent as plain text.
 
 ---
