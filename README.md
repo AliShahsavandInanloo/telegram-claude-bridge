@@ -83,8 +83,17 @@ A session is one persistent Claude conversation. `/new` allocates it locally wit
 `--session-id`; the first successful run makes it resumable, and every later job
 resumes with `--resume`. Queued jobs keep the session identity they were enqueued
 with, even if you create or switch sessions meanwhile. State lives in
-`state/sessions.json` (written atomically); old flat-format files are migrated
-automatically.
+`state/sessions.json` (schema v2, written atomically); old formats are
+migrated automatically.
+
+## Message delivery
+
+Updates are processed **at-most-once**: the next Telegram offset is saved
+before an update is handled, so a command can be skipped after a crash but
+never executed twice. On the **first** start, messages sent while the bridge
+was offline are skipped by default (`PROCESS_INITIAL_BACKLOG=false`) instead
+of executing stale commands; set it to `true` to consume the backlog. Later
+restarts resume from the saved offset.
 
 ## Tests
 
@@ -92,13 +101,16 @@ automatically.
 npm test
 ```
 
-30 sandboxed tests cover auth, prompt passing, session lifecycle, queue fairness,
-proxy parsing/redaction, atomic persistence, and crash safety. No network or
-`claude` process is touched.
+52 sandboxed tests cover auth, prompt passing, session lifecycle, queue
+fairness and close semantics, proxy parsing/redaction, atomic persistence,
+first-start backlog skipping, at-most-once offset ordering, Windows `.cmd`
+shim handling, and `/status` privacy. No network or `claude` process is touched.
 
 ## Troubleshooting
 
 - `refusing to start: ALLOWED_TELEGRAM_IDS …` → set your numeric ID(s) in `.env`.
+- `refusing to start: … .cmd shim …` → point `CLAUDE_BIN` at the native `claude.exe`
+  (npm installs a `claude.cmd` shim that cannot be safely spawned without a shell).
 - `cannot reach Telegram yet` repeating → your VPN is off; turn it on, the bridge
   re-probes within 10 s. Or pin `TELEGRAM_PROXY_URL`.
 - 401 from Telegram → wrong `TELEGRAM_BOT_TOKEN`.

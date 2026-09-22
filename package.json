@@ -5,8 +5,8 @@
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",
-    "test": "node test/bridge.test.js",
-    "check": "node --check bridge.js"
+    "test": "node test/bridge.test.js && node test/regression.test.js",
+    "check": "node --check bridge.js && node --check lib/config.js && node --check lib/commands.js && node --check lib/proxy.js && node --check lib/sessions.js && node --check lib/queue.js && node --check lib/telegram.js && node --check lib/offset.js && node --check test/bridge.test.js && node --check test/regression.test.js"
   },
   "engines": {
     "node": ">=18"

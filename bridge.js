@@ -17,6 +17,11 @@
  * Bot API calls go through https.request so http/socks proxy agents actually
  * apply (built-in fetch would silently ignore them).
  *
+ * Telegram update delivery is AT-MOST-ONCE: the next offset is persisted
+ * before an update is handled, so a crash can skip an update but never
+ * re-execute one. First-ever start also skips stale backlog by default
+ * (PROCESS_INITIAL_BACKLOG=false) instead of executing offline messages.
+ *
  * Commands: /start /help /new /sessions /use /stop /queue /status
  * (registered with Telegram via setMyCommands for slash autocomplete)
  */
@@ -30,6 +35,7 @@ const { spawn } = require('child_process');
 const { createTelegramClient } = require('./lib/telegram');
 const { createSessionStore } = require('./lib/sessions');
 const { createJobQueue } = require('./lib/queue');
+const { createOffsetStore } = require('./lib/offset');
 const { BOT_COMMANDS, parseCommand, helpText } = require('./lib/commands');
 const {
   parseAllowlist,
@@ -37,33 +43,18 @@ const {
   validateProxyUrl,
   validateBotToken,
   ensureWritableDir,
+  validateBridgeCwd,
   resolveClaudeBin,
+  applyEnvFile,
+  safeClaudeLabel,
 } = require('./lib/config');
 
 // ---------------------------------------------------------------------------
-// .env loading (before config validation)
+// .env loading (BEFORE any config value is derived from the environment)
 // ---------------------------------------------------------------------------
 
 const ROOT = __dirname;
-const STATE_DIR = process.env.BRIDGE_STATE_DIR || path.join(ROOT, 'state'); // overridable for tests
-const SESSIONS_FILE = path.join(STATE_DIR, 'sessions.json');
-const OFFSET_FILE = path.join(STATE_DIR, 'offset.txt');
-
-function loadEnvFile() {
-  const envPath = path.join(ROOT, '.env');
-  if (!fs.existsSync(envPath)) return;
-  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    if (!line || line.trim().startsWith('#')) continue;
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!m) continue;
-    let v = m[2];
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-      v = v.slice(1, -1);
-    }
-    if (!(m[1] in process.env)) process.env[m[1]] = v;
-  }
-}
-loadEnvFile();
+applyEnvFile(ROOT); // real environment variables take precedence over .env
 
 // ---------------------------------------------------------------------------
 // Logging (levels; never log tokens, prompts, proxy credentials)
@@ -124,24 +115,35 @@ const maxErrCheck = intEnv(process.env.MAX_STDERR_BYTES, { name: 'MAX_STDERR_BYT
 if (!maxErrCheck.ok) failStartup(maxErrCheck.error);
 const MAX_STDERR_BYTES = maxErrCheck.value;
 
+// First-start Telegram backlog policy. Safe default: SKIP all pending updates
+// on the very first run (no offset file yet) so historical messages sent while
+// the bridge was offline are never executed. Set PROCESS_INITIAL_BACKLOG=true
+// to opt in to consuming them on first start.
+const PROCESS_INITIAL_BACKLOG = /^(1|true|yes)$/i.test(process.env.PROCESS_INITIAL_BACKLOG || '');
+
+const STATE_DIR = process.env.BRIDGE_STATE_DIR || path.join(ROOT, 'state');
+const SESSIONS_FILE = path.join(STATE_DIR, 'sessions.json');
+const OFFSET_FILE = path.join(STATE_DIR, 'offset.txt');
+
 const dirCheck = ensureWritableDir(STATE_DIR);
 if (!dirCheck.ok) failStartup(dirCheck.error);
 
-const CLAUDE_BIN = (process.env.CLAUDE_BIN || 'claude').trim();
-const claudeCheck = resolveClaudeBin(CLAUDE_BIN);
-if (!claudeCheck.ok) failStartup(`${claudeCheck.error}. Set CLAUDE_BIN to the full path of the claude executable.`);
-const claudeDisplay = claudeCheck.resolved === 'claude' ? 'claude (on PATH)' : claudeCheck.resolved;
+const claudeCheck = resolveClaudeBin(process.env.CLAUDE_BIN || 'claude');
+if (!claudeCheck.ok) failStartup(`${claudeCheck.error}. Set CLAUDE_BIN to the full path of the native claude executable.`);
+const claudeDisplay = safeClaudeLabel(claudeCheck.resolved); // basename only — no paths over Telegram
 
-const DEFAULT_CWD = (process.env.BRIDGE_CWD || ROOT).trim();
-if (!fs.existsSync(DEFAULT_CWD)) failStartup(`BRIDGE_CWD "${DEFAULT_CWD}" does not exist.`);
+const cwdCheck = validateBridgeCwd(process.env.BRIDGE_CWD || ROOT);
+if (!cwdCheck.ok) failStartup(cwdCheck.error);
+const DEFAULT_CWD = cwdCheck.resolved;
 
 // ---------------------------------------------------------------------------
-// Telegram client + session store
+// Stores, queue, Telegram client
 // ---------------------------------------------------------------------------
 
 let tg = createTelegramClient({ token: BOT_TOKEN, explicitProxy: EXPLICIT_PROXY, log: logInfo });
 
 const store = createSessionStore(SESSIONS_FILE);
+const offsetStore = createOffsetStore(OFFSET_FILE);
 
 // ---------------------------------------------------------------------------
 // Bounded stream capture (never let a chatty child consume memory)
@@ -175,7 +177,7 @@ function boundedCapture(limit) {
 // Claude job execution (one-shot completion; spawn, never shell)
 // ---------------------------------------------------------------------------
 
-let currentRun = null; // { chatId, job, child, startedAt, cancelled, cancelReason } | null
+let currentRun = null; // { chatId, job, child, startedAt, cancelled, cancelReason, cancel } | null
 
 function buildClaudeArgs(job) {
   // The user's text IS the prompt (-p <text>). Never built via a shell string.
@@ -267,10 +269,16 @@ function runClaudeJob(chatId, job, { spawnFn = spawn } = {}) {
         logInfo(`job done chat=${chatId} session=${job.sessionName} code=${code} signal=${signal || '-'} in ${secs}s out=${stdoutCap.text.length}B`);
         currentRun = null;
 
+        let persistError = null;
         if (code === 0 && !cancelled) {
           // Session is now real on Claude's side; future jobs resume it.
           store.markInitialized(chatId, job.sessionId);
-          store.save();
+          try {
+            await store.save();
+          } catch (err) {
+            persistError = err;
+            logWarn(`could not persist session state: ${err.message}`);
+          }
         }
 
         let header;
@@ -280,6 +288,7 @@ function runClaudeJob(chatId, job, { spawnFn = spawn } = {}) {
           header = `🤖 *${job.sessionName}* — done in ${secs}s`;
           if (code !== 0) header += ` (exit ${code})`;
         }
+        if (persistError) header += '\n⚠️ (session state not saved to disk)';
 
         let body = stdoutCap.text.trim();
         if (!body && stderrCap.text.trim()) body = `stderr:\n${stderrCap.text.trim()}`;
@@ -418,15 +427,22 @@ async function handleMessage(msg) {
     cwd: DEFAULT_CWD,
     chatId,
   };
-  const res = queue.enqueue(chatId, job, {
-    onQueued: (position) => {
-      reply(chatId, `📥 Queued at position ${position} for session *${job.sessionName}*. You'll get the report here.`);
-    },
-    onRejected: (max) => {
-      reply(chatId, `⚠️ Queue is full for this chat (${max} waiting). Use /stop to clear or wait for jobs to finish.`);
-    },
-  });
-  if (!res.ok) logWarn(`enqueue rejected chat=${chatId}`);
+  let res;
+  try {
+    res = queue.enqueue(chatId, job, {
+      onQueued: (position) => {
+        reply(chatId, `📥 Queued at position ${position} for session *${job.sessionName}*. You'll get the report here.`).catch(() => {});
+      },
+      onRejected: (max) => {
+        reply(chatId, `⚠️ Queue is full for this chat (${max} waiting). Use /stop to clear or wait for jobs to finish.`).catch(() => {});
+      },
+    });
+  } catch (err) {
+    // Races with shutdown surface here; never an unhandled rejection.
+    logWarn('enqueue failed:', err.message);
+    return;
+  }
+  if (!res.ok) logWarn(`enqueue rejected chat=${chatId} (${res.error})`);
 }
 
 async function dispatchCommand(chatId, parsed) {
@@ -443,7 +459,14 @@ async function dispatchCommand(chatId, parsed) {
         await reply(chatId, `❌ ${created.error}`);
         return;
       }
-      store.save();
+      try {
+        await store.save();
+      } catch (err) {
+        // Roll back the in-memory mutation; never claim success.
+        store.remove(chatId, created.name);
+        await reply(chatId, `❌ Could not create session (failed to save): ${err.message}`);
+        return;
+      }
       await reply(chatId, `✨ New session *${created.name}* created and active. Send me your first task.`);
       return;
     }
@@ -469,12 +492,19 @@ async function dispatchCommand(chatId, parsed) {
         await reply(chatId, 'Usage: /use <name>');
         return;
       }
+      const previous = store.active(chatId).name;
       const res = store.setActive(chatId, arg);
       if (!res.ok) {
         await reply(chatId, `No session named *${arg}*. Use /sessions to list.`);
         return;
       }
-      store.save();
+      try {
+        await store.save();
+      } catch (err) {
+        store.setActive(chatId, previous); // roll back
+        await reply(chatId, `❌ Could not switch session (failed to save): ${err.message}`);
+        return;
+      }
       await reply(chatId, `🔀 Switched to *${arg}*.`);
       return;
     }
@@ -514,30 +544,64 @@ async function dispatchCommand(chatId, parsed) {
 }
 
 // ---------------------------------------------------------------------------
-// Long polling (durable offset; one malformed update never blocks the loop)
+// Long polling
+//
+// Update durability: AT-MOST-ONCE. The next offset is committed to disk
+// BEFORE the update is handled (centralized in advanceOffset), so a crash
+// can lose an update but can never re-execute one. Backlog policy: on the
+// very first start (no persisted offset) pending updates are skipped via a
+// negative getUpdates offset unless PROCESS_INITIAL_BACKLOG=true.
 // ---------------------------------------------------------------------------
 
-function readOffset() {
-  try {
-    const v = parseInt(fs.readFileSync(OFFSET_FILE, 'utf8').trim(), 10);
-    return Number.isSafeInteger(v) && v >= 0 ? v : 0;
-  } catch {
+/**
+ * THE single place the update offset advances. Commits the next offset to
+ * disk BEFORE the caller handles the update — deliberate AT-MOST-ONCE
+ * semantics (see header comment). `osImpl` injectable for tests.
+ */
+function advanceOffset(current, updateId, osImpl = offsetStore) {
+  const next = Math.max(current, updateId + 1);
+  osImpl.commit(next); // intentionally before handling (at-most-once)
+  return next;
+}
+
+/**
+ * Backlog policy at startup.
+ *
+ * - Persisted offset exists  -> resume normally from it (never purge).
+ * - No offset (first start)  -> PROCESS_INITIAL_BACKLOG=false (default):
+ *   fetch once with offset = -1; Telegram's documented behavior is to skip
+ *   all pending updates and return only the most recent one, moving the
+ *   cursor past historical messages so offline commands are NOT executed.
+ *   With PROCESS_INITIAL_BACKLOG=true the backlog is consumed normally.
+ */
+async function purgeBacklogIfFirstStart({ osImpl = offsetStore, tgImpl = tg } = {}) {
+  const persisted = osImpl.load();
+  if (persisted !== null) {
+    logInfo(`resuming from persisted Telegram offset ${persisted}`);
+    return persisted;
+  }
+  // Read at call time (not import time) so tests can exercise both branches.
+  if (/^(1|true|yes)$/i.test(process.env.PROCESS_INITIAL_BACKLOG || '')) {
+    logInfo('PROCESS_INITIAL_BACKLOG=true: will process any messages sent while offline');
     return 0;
   }
-}
-
-function writeOffset(offset) {
+  let latest = null;
   try {
-    const tmp = `${OFFSET_FILE}.tmp`;
-    fs.writeFileSync(tmp, String(offset));
-    fs.renameSync(tmp, OFFSET_FILE);
+    const updates = await tgImpl.request('getUpdates', { offset: -1, timeout: 0, allowed_updates: ['message'] });
+    if (Array.isArray(updates) && updates.length > 0) {
+      latest = updates[updates.length - 1].update_id;
+      logInfo(`first start: skipping ${latest + 1} backlog update(s) sent while offline (set PROCESS_INITIAL_BACKLOG=true to change)`);
+      advanceOffset(-1, latest, osImpl);
+    }
   } catch (err) {
-    logWarn('failed to persist offset:', err.message);
+    // Telegram unreachable: nothing to purge yet; normal polling will retry.
+    logWarn('backlog probe skipped:', err.message);
   }
+  return latest === null ? 0 : latest + 1;
 }
 
-async function pollLoop() {
-  let offset = readOffset();
+async function pollLoop(startOffset) {
+  let offset = startOffset;
   while (!shuttingDown) {
     try {
       const updates = await tg.request('getUpdates', {
@@ -546,8 +610,7 @@ async function pollLoop() {
         allowed_updates: ['message'],
       });
       for (const upd of updates || []) {
-        offset = Math.max(offset, upd.update_id + 1);
-        writeOffset(offset); // consume before handling: no re-execution after restart
+        offset = advanceOffset(offset, upd.update_id); // persisted BEFORE handling
         try {
           if (upd.message) await handleMessage(upd.message);
         } catch (err) {
@@ -572,9 +635,10 @@ let shuttingDown = false;
 
 function shutdown(signal) {
   if (shuttingDown) return;
-  shuttingDown = true;
+  shuttingDown = true; // 1. mark shutting down (poll loop + handlers check this)
   logInfo(`${signal} received, shutting down…`);
-  if (currentRun && currentRun.child && currentRun.child.exitCode === null) {
+  queue.close(); // 2-4. stop accepting/clear queued work — no new Claude can start
+  if (currentRun && currentRun.child && currentRun.child.exitCode === null) { // 5.
     try {
       currentRun.child.kill('SIGTERM');
     } catch {
@@ -588,8 +652,7 @@ function shutdown(signal) {
       }
     }, 3000);
   }
-  queue.close();
-  Promise.race([store.flush(), sleep(3000)]).then(() => {
+  Promise.race([store.flush(), sleep(3000)]).then(() => { // 6-7.
     logInfo('bye');
     process.exit(0);
   });
@@ -604,7 +667,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 if (require.main === module) (async () => {
   logInfo(`starting bridge; claude=${claudeDisplay}; state dir=${STATE_DIR}`);
-  logInfo(`allowlist: ${ALLOWED.size} authorized user(s)`);
+  logInfo(`allowlist: ${ALLOWED.size} authorized user(s); backlog on first start: ${PROCESS_INITIAL_BACKLOG ? 'process' : 'skip'}`);
 
   let me = null;
   while (!me) {
@@ -618,7 +681,6 @@ if (require.main === module) (async () => {
   botUsername = me.username || '';
   const { label, source } = tg.state();
   logInfo(`authorized as @${botUsername}. Proxy: ${label} [${source || 'direct'}]`);
-  logInfo('listening for messages… (Ctrl+C to stop)');
 
   // Register slash-command autocomplete / menu (non-fatal on failure).
   try {
@@ -633,13 +695,17 @@ if (require.main === module) (async () => {
     logWarn('setChatMenuButton failed (bridge continues):', err.message);
   }
 
+  // First-start backlog policy: skip historical updates unless opted in.
+  const startOffset = await purgeBacklogIfFirstStart();
+  logInfo('listening for messages… (Ctrl+C to stop)');
+
   // Periodically re-resolve the proxy so VPN changes are noticed even without errors.
   const reprobe = setInterval(() => {
     if (!shuttingDown) tg.refresh('periodic');
   }, 60_000);
   if (reprobe.unref) reprobe.unref();
 
-  await pollLoop();
+  await pollLoop(startOffset);
 })().catch((err) => {
   logError('fatal:', err.message || err);
   process.exit(1);
@@ -656,7 +722,14 @@ module.exports = {
     runClaudeJob,
     store,
     queue,
+    offsetStore,
     claudeRunner,
+    advanceOffset,
+    purgeBacklogIfFirstStart,
+    setStore(fake) {
+      // Tests inject a store-backed stub (see test/bridge.test.js).
+      Object.assign(store, fake);
+    },
     setTelegram(fake) {
       tg = fake; // tests inject a no-network client
     },

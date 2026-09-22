@@ -87,8 +87,8 @@ Hard timeout per job: `CLAUDE_TIMEOUT_MS` (default 30 min; SIGTERM then SIGKILL)
 ├── README.md            # quick start
 ├── DOCUMENTATION.md     # this file
 └── state\
-    ├── sessions.json    # chatId → { active, list: { name → {id, initialized} } }
-    └── offset.txt       # Telegram update offset (crash-safe resume)
+    ├── sessions.json    # { version: 2, chats: { chatId → { activeSession, sessions: { name → {id, initialized} } } } }
+    └── offset.txt       # Telegram update offset (at-most-once delivery; see §Delivery)
 ```
 
 ---
@@ -305,6 +305,24 @@ access to this machine. To revoke access, remove the ID from `.env` and restart.
 
 ---
 
+## 10b. Message delivery semantics
+
+Telegram updates are processed **at-most-once**. The bridge persists the next
+update offset **before** executing the update: this prevents a command from
+being executed twice after a crash, but a crash between persisting and
+handling can cause that update to be skipped. For a bridge that runs Claude
+with broad machine permissions, never re-executing an old command is the
+safer trade.
+
+**First-start backlog policy** (`PROCESS_INITIAL_BACKLOG`, default `false`):
+on the very first start (no saved offset yet) the bridge skips all messages
+sent while it was offline, instead of executing potentially hours-old
+commands. With `PROCESS_INITIAL_BACKLOG=true` the backlog is consumed
+normally. On every later restart the bridge resumes from the saved offset —
+nothing is purged and nothing is re-executed.
+
+---
+
 ## 11. Configuration reference (.env)
 
 | Variable | Required | Default | Meaning |
@@ -312,8 +330,10 @@ access to this machine. To revoke access, remove the ID from `.env` and restart.
 | `TELEGRAM_BOT_TOKEN` | yes | — | from @BotFather (fallback: `TELEGRAM_CLAUDE_BOT_TOKEN`) |
 | `ALLOWED_TELEGRAM_IDS` | **yes** | — | comma-separated numeric user IDs; missing/empty/malformed = startup error |
 | `TELEGRAM_PROXY_URL` | no | auto | explicit proxy for Telegram traffic (loopback hosts allowed) |
-| `CLAUDE_BIN` | no | `claude` | full path to the claude executable if not on PATH |
-| `BRIDGE_CWD` | no | bridge folder | working directory for Claude jobs (must exist) |
+| `CLAUDE_BIN` | no | `claude` | claude executable if not on PATH; a Windows npm `.cmd` shim is resolved to the underlying `claude.exe`, otherwise startup fails with instructions |
+| `BRIDGE_CWD` | no | bridge folder | working directory for Claude jobs (must exist **and be a directory**) |
+| `BRIDGE_STATE_DIR` | no | `./state` | directory for `sessions.json` / `offset.txt` (created if missing); read from `.env` too |
+| `PROCESS_INITIAL_BACKLOG` | no | `false` | `false` (safe default): on the very first start, messages sent while offline are skipped, never executed. `true`: consume them. Restarts always resume from the saved offset. |
 | `CLAUDE_TIMEOUT_MS` | no | `1800000` | per-job timeout (5 s … 4 h) |
 | `MAX_QUEUE_PER_CHAT` | no | `3` | max waiting jobs per chat (1 … 100) |
 | `MAX_STDOUT_BYTES` | no | `524288` | captured claude stdout per job (1 KiB … 8 MiB) |
@@ -333,12 +353,17 @@ at startup.
 npm test
 ```
 
-30 sandboxed tests (no framework, no network, no spawned claude) verify:
+52 sandboxed tests (no framework, no network, no spawned claude) verify:
 fail-closed auth and config validation; prompt text reaching Claude's args;
 `--session-id` vs `--resume` semantics; queued jobs keeping their session
 identity; group-suffix command parsing; command-menu consistency; proxy label
 redaction; Windows semicolon proxy parsing; loopback proxy acceptance;
 double-completion guard; bounded capture; global FIFO queue fairness;
+queue-close lifecycle; first-start backlog skipping; at-most-once offset
+ordering; sessions named `active`/`list` surviving restarts (schema v2);
+Windows `.cmd` shim detection; `.env` loading precedence; `BRIDGE_CWD`
+directory validation; persistence-failure propagation with `/new` rollback;
+and `/status` path privacy.
 atomic session persistence + corruption recovery; and that the bot token
 never leaks into outgoing messages.
 

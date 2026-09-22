@@ -22,7 +22,7 @@ process.env.CLAUDE_BIN = ''; // bare 'claude' (never actually spawned)
 const {
   validateSessionName, parseAllowlist, intEnv, validateProxyUrl, resolveClaudeBin,
 } = require('../lib/config');
-const { parseCommand, BOT_COMMANDS, COMMAND_NAMES, helpText } = require('../lib/commands');
+const { parseCommand, BOT_COMMANDS, helpText } = require('../lib/commands');
 const { safeProxyLabel, parseWindowsProxyServer, envProxyUrl, resolveProxy } = require('../lib/proxy');
 const { createSessionStore, migrateChatEntry } = require('../lib/sessions');
 const { createJobQueue } = require('../lib/queue');
@@ -38,9 +38,6 @@ T.setTelegram({
     sent.push({ method, params });
     if (method === 'getMe') return { username: 'TestBridgeBot' };
     return {};
-  },
-  safeSend: async (method, params) => {
-    sent.push({ method, params });
   },
   state: () => ({ agent: null, source: null, label: 'direct' }),
   refresh: () => ({}),
@@ -130,9 +127,10 @@ function lastSends(n = 1) {
   });
 
   await test('registered command definitions match implemented commands (issue 9/15/17)', () => {
+    // BOT_COMMANDS is the single source of truth; dispatcher must cover it.
     const names = BOT_COMMANDS.map((c) => c.command);
     assert.strictEqual(new Set(names).size, names.length, 'no duplicates');
-    assert.deepStrictEqual(COMMAND_NAMES, new Set(['start', 'help', 'new', 'sessions', 'use', 'stop', 'queue', 'status']));
+    assert.deepStrictEqual(new Set(names), new Set(['start', 'help', 'new', 'sessions', 'use', 'stop', 'queue', 'status']));
     for (const c of BOT_COMMANDS) assert.ok(c.description && c.description.length <= 256);
   });
 
@@ -241,11 +239,16 @@ function lastSends(n = 1) {
     await store.save();
     await store.flush();
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')); // throws if half-written
-    assert.ok(parsed['7'].list.alpha.id);
+    // v2 schema: { version: 2, chats: { "<chatId>": { activeSession, sessions } } }
+    assert.strictEqual(parsed.version, 2);
+    assert.ok(parsed.chats['7'].sessions.alpha.id);
     assert.strictEqual(fs.readdirSync(dir).filter((f) => f.startsWith('sessions.json.tmp')).length, 0);
     const store2 = createSessionStore(file);
     assert.strictEqual(store2.get('7', 'alpha').initialized, false);
     assert.ok(store2.get('8', 'beta'));
+    // 'active'/'list' metadata no longer shares the session namespace (issue 3)
+    const rawChats = parsed.chats;
+    assert.ok(rawChats['7'].activeSession === 'alpha' || rawChats['7'].sessions[rawChats['7'].activeSession]);
   });
 
   await test('corrupted session file backed up, load continues (issue 14)', () => {
