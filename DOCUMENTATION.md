@@ -451,6 +451,34 @@ type state\offset.txt
 
 ---
 
+## 13b. Claude Session Manager (managed sessions)
+
+Beyond one-shot jobs, the bridge can MANAGE long-lived Claude sessions end to
+end: it owns the process lifecycle, the working directory, stdin/stdout, and
+all session metadata.
+
+- **Registry** (`state/claude-sessions.json`, schema v1): `{id, name, project,
+  claudeSessionId, status, pid, createdAt, lastActivity, owner}` — atomic
+  writes, corruption backup, snapshot/restore rollback (same guarantees as the
+  legacy session store).
+- **Managed launcher** (`lib/claude/launcher.js`): spawns Claude with the same
+  launch-spec rules as one-shot mode (`{command, prefixArgs}`, `shell:false`,
+  argv-only — never a shell). Managed mode runs `--output-format stream-json
+  --input-format stream-json`: the user's task text is written to the child's
+  STDIN as one JSON line, so Telegram text can never reach a shell.
+- **Streaming** (`lib/claude/output.js`): progress messages are buffered,
+  grouped and rate-limited (≥ 15 s apart, size-capped); the final result is
+  always delivered.
+- **Files**: uploads land in `<project>/incoming/` and Claude is notified;
+  `/files` lists project files, `/download <name>` sends one back
+  (basename-only, path-traversal safe, 20 MB cap).
+- **Discovery** (`/discover`): read-only inventory of running Claude
+  processes (PID + image name via tasklist/ps). A discovered process is NOT a
+  managed session and is NOT attachable — the bridge never injects input into
+  processes it does not own.
+- `MANAGED_TASK_TIMEOUT_MS` (default 4 h) bounds a managed task; the process
+  is stopped and the chat notified.
+
 ## 14. Extending the bridge
 
 Natural next steps, all localized:

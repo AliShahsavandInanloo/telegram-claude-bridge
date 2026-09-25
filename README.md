@@ -66,13 +66,35 @@ route, and how many users are authorized.
 | Command | Effect |
 |---|---|
 | `/start`, `/help` | show the command summary |
-| `/new <name>` | create a fresh named session and switch to it |
+| `/new <name>` | create a fresh one-shot session and switch to it |
+| `/new <name> <project-path>` | create a **managed Claude session** bound to a project and attach to it |
 | `/sessions` | list sessions; `▶️` marks the active one, `(new)` = not yet used by Claude |
-| `/use <name>` | switch the active session |
+| `/use <name>` | switch the active one-shot session |
+| `/attach <name\|number>` | attach this chat to a managed session |
+| `/detach` | detach from the managed session |
+| `/current` | show the currently attached managed session |
+| `/session-status` | process state, current task, runtime, latest output |
+| `/files` | list files in the attached project |
+| `/download <file>` | send a project file back here |
+| `/discover` | list running Claude processes (read-only inventory — never attachable) |
 | `/stop` | cancel the running job (if it belongs to this chat) and clear this chat's queued jobs |
 | `/queue` | what's running and how many jobs are queued (this chat / global) |
 | `/status` | Claude executable, active session, job state, queue, proxy (credentials redacted), uptime |
-| any other text | becomes the prompt for the active session; the report is sent back here |
+| any other text | a task for the attached managed session — or, if none, the one-shot active session |
+
+### Managed vs one-shot sessions
+
+- **One-shot** (classic): each message spawns `claude -p <text>` against a named
+  conversation; the process ends when the answer is done.
+- **Managed**: `/new <name> <project-path>` registers a session the bridge fully
+  owns — project directory, Claude process lifecycle, stdin/stdout protocol and
+  metadata (`state/claude-sessions.json`). Attach with `/attach`, then messages
+  stream incremental progress (rate-limited, no spam) and the final report.
+  Files uploaded to the chat land in `<project>/incoming/` and Claude is
+  notified; `/download` returns project files.
+- **Discovered processes**: `/discover` lists Claude processes already running
+  on the machine. These are inventory only — the bridge never injects input
+  into processes it does not own, so they are not attachable.
 
 Commands also work group-style: `/status@YourBot` is accepted, and commands
 addressed to a different bot are ignored.
@@ -113,7 +135,7 @@ Later restarts resume from the saved offset.
 npm test
 ```
 
-78 sandboxed tests (30 + 48) cover auth, prompt passing, session lifecycle,
+105 sandboxed tests (30 + 59 + 16) cover auth, prompt passing, session lifecycle,
 queue fairness and close semantics, proxy parsing/redaction, atomic
 persistence, first-start backlog skipping (empty and non-empty), at-most-once
 offset ordering incl. persistence-failure blocking, offset state categories

@@ -137,7 +137,10 @@ function lastSends(n = 1) {
     // BOT_COMMANDS is the single source of truth; dispatcher must cover it.
     const names = BOT_COMMANDS.map((c) => c.command);
     assert.strictEqual(new Set(names).size, names.length, 'no duplicates');
-    assert.deepStrictEqual(new Set(names), new Set(['start', 'help', 'new', 'sessions', 'use', 'stop', 'queue', 'status']));
+    assert.deepStrictEqual(
+      new Set(names),
+      new Set(['start', 'help', 'new', 'sessions', 'use', 'attach', 'detach', 'current', 'session-status', 'files', 'download', 'discover', 'stop', 'queue', 'status'])
+    );
     for (const c of BOT_COMMANDS) assert.ok(c.description && c.description.length <= 256);
   });
 

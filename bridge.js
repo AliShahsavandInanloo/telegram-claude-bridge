@@ -37,6 +37,10 @@ const { createSessionStore } = require('./lib/sessions');
 const { createJobQueue } = require('./lib/queue');
 const { createOffsetStore } = require('./lib/offset');
 const { BOT_COMMANDS, parseCommand, helpText } = require('./lib/commands');
+const { createRegistry } = require('./lib/claude/registry');
+const { createClaudeManager } = require('./lib/claude/manager');
+const { createProgressReporter } = require('./lib/claude/output');
+const { discoverClaudeProcesses } = require('./lib/claude/discover');
 const {
   parseAllowlist,
   intEnv,
@@ -124,6 +128,16 @@ const PROCESS_INITIAL_BACKLOG = /^(1|true|yes)$/i.test(process.env.PROCESS_INITI
 const STATE_DIR = process.env.BRIDGE_STATE_DIR || path.join(ROOT, 'state');
 const SESSIONS_FILE = path.join(STATE_DIR, 'sessions.json');
 const OFFSET_FILE = path.join(STATE_DIR, 'offset.txt');
+const REGISTRY_FILE = path.join(STATE_DIR, 'claude-sessions.json');
+const INCOMING_DIR = path.join(STATE_DIR, 'incoming');
+
+// Managed-session task timeout and streaming cadence (distinct from the
+// legacy one-shot job timeout). Defaults keep long analyses alive for hours.
+const taskTimeoutCheck = intEnv(process.env.MANAGED_TASK_TIMEOUT_MS, { name: 'MANAGED_TASK_TIMEOUT_MS', def: 4 * 60 * 60 * 1000, min: 10000, max: 24 * 60 * 60 * 1000 });
+if (!taskTimeoutCheck.ok) failStartup(taskTimeoutCheck.error);
+const MANAGED_TASK_TIMEOUT_MS = taskTimeoutCheck.value;
+const PROGRESS_MIN_INTERVAL_MS = 15_000; // anti-spam: >= 15 s between progress sends
+const TELEGRAM_FILE_MAX_BYTES = 20 * 1024 * 1024; // Bot API download cap for this bridge
 
 const dirCheck = ensureWritableDir(STATE_DIR);
 if (!dirCheck.ok) failStartup(dirCheck.error);
@@ -145,6 +159,17 @@ let tg = createTelegramClient({ token: BOT_TOKEN, explicitProxy: EXPLICIT_PROXY,
 
 const store = createSessionStore(SESSIONS_FILE);
 const offsetStore = createOffsetStore(OFFSET_FILE);
+const registry = createRegistry(REGISTRY_FILE);
+
+// Managed-session spawn seam: tests replace this to avoid real processes.
+let managedSpawnFn = spawn;
+const claudeManager = createClaudeManager({
+  reg: registry,
+  launch: CLAUDE_LAUNCH,
+  spawnFn: (...a) => managedSpawnFn(...a),
+  logInfo,
+  logError: logError,
+});
 
 // ---------------------------------------------------------------------------
 // Bounded stream capture (never let a chatty child consume memory)
@@ -393,6 +418,234 @@ function statusText(chatId) {
 }
 
 // ---------------------------------------------------------------------------
+// Managed-session helpers (routing, formatting, files)
+// ---------------------------------------------------------------------------
+
+let msgUserId = ''; // sender id of the message currently being handled
+
+/** Privacy: project paths are shown basename-only over Telegram. */
+function projectLabel(projectPath) {
+  const base = path.basename(String(projectPath || ''));
+  return base || '(project)';
+}
+
+/** Resolve a /attach|/switch argument: 1-based number or exact name. */
+function resolveSessionArg(arg) {
+  const list = claudeManager.list();
+  const n = Number(String(arg || '').trim());
+  if (Number.isInteger(n) && n >= 1 && n <= list.length) return list[n - 1];
+  return claudeManager.list().find((e) => e.name.toLowerCase() === String(arg).trim().toLowerCase()) || null;
+}
+
+/** Numbered menu of managed sessions. */
+function listNumbered(entries) {
+  if (!entries.length) return '(no managed sessions yet — create one with /new <name> <project-path>)';
+  return entries.map((e, i) => `${i + 1}. *${e.name}* — ${projectLabel(e.project)} [${e.status}]`).join('\n');
+}
+
+function formatSessionBlock(entry, st) {
+  const p = st ? st.process : { running: false, pid: null, busy: false };
+  return [
+    `Session: *${entry.name}*`,
+    `Project: ${projectLabel(entry.project)}`,
+    `Status: ${p.running ? (p.busy ? 'running (busy)' : 'idle') : 'stopped'}`,
+    p.pid ? `PID: ${p.pid}` : null,
+  ].filter(Boolean).join('\n');
+}
+
+function formatSessionStatus(st) {
+  const e = st.entry;
+  const p = st.process;
+  const runtime = p.taskStartedAt ? formatUptime(Math.floor((Date.now() - p.taskStartedAt) / 1000)) : null;
+  const lines = [
+    `Session: *${e.name}* (${projectLabel(e.project)})`,
+    `Process: ${p.running ? `running${p.pid ? ` (pid ${p.pid})` : ''}` : `stopped${p.exit ? `, exit ${p.exit.code}` : ''}`}`,
+    `Task: ${p.task ? p.task.slice(0, 120) : 'none'}`,
+    runtime ? `Runtime: ${runtime}` : null,
+    `Queued tasks: ${p.queuedTasks}`,
+  ].filter(Boolean);
+  if (p.latestOutput) {
+    lines.push('', 'Latest output:', p.latestOutput.slice(-800));
+  }
+  return lines.join('\n');
+}
+
+/** Route a chat message into its attached managed session (with streaming). */
+function routeToManaged(chatId, entry, text) {
+  const reporter = createProgressReporter({
+    send: (t) => reply(chatId, `⚙️ *${entry.name}*\n${t}`),
+    minIntervalMs: PROGRESS_MIN_INTERVAL_MS,
+    logWarn,
+  });
+  const timeout = setTimeout(() => {
+    claudeManager.stopSession(entry.id, 'task timeout');
+    reply(chatId, `⏱️ *${entry.name}* task exceeded ${Math.round(MANAGED_TASK_TIMEOUT_MS / 60000)} min and was stopped.`).catch(() => {});
+  }, MANAGED_TASK_TIMEOUT_MS);
+  if (timeout.unref) timeout.unref();
+
+  claudeManager
+    .route(chatId, text, {
+      onQueued: (position) => {
+        reply(chatId, `📥 *${entry.name}* is busy — task queued at position ${position}.`).catch(() => {});
+      },
+      onProgress: (p) => reporter.push(p.text),
+    })
+    .then((result) => {
+      clearTimeout(timeout);
+      if (!result.ok && !result.queued) {
+        reply(chatId, `❌ *${entry.name}*: ${result.summary || 'task failed'}`).catch(() => {});
+        return;
+      }
+      if (result.queued) return; // reported via onQueued
+      reporter.complete(result.summary || `Done in ${formatUptime(Math.floor((result.runtimeMs || 0) / 1000))}.`);
+    })
+    .catch((err) => {
+      clearTimeout(timeout);
+      logError(`managed routing error chat=${chatId}: ${err.message}`);
+      reply(chatId, `❌ *${entry.name}* routing failed: ${err.message}`).catch(() => {});
+    });
+}
+
+// --------------------------- file exchange ---------------------------------
+
+/** Download a Telegram file into <project>/incoming/ (best effort, capped). */
+async function handleFileUpload(chatId, document) {
+  const entry = registry.attached(chatId);
+  if (!entry) {
+    await reply(chatId, 'Attach to a session first (/attach <name|number>) to upload files.');
+    return;
+  }
+  const fileName = path.basename(String(document.file_name || 'upload.bin')).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 100) || 'upload.bin';
+  if ((document.file_size || 0) > TELEGRAM_FILE_MAX_BYTES) {
+    await reply(chatId, `❌ File too large (max ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024 / 1024)} MB).`);
+    return;
+  }
+  try {
+    const fileInfo = await tg.request('getFile', { file_id: document.file_id });
+    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+    const res = await new Promise((resolve, reject) => {
+      const { agent } = tg.state();
+      const mod = require('https');
+      mod.get(url, { agent: agent || undefined }, resolve).on('error', reject);
+    });
+    if (res.statusCode !== 200) {
+      throw new Error(`download failed: HTTP ${res.statusCode}`);
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const c of res) {
+      size += c.length;
+      if (size > TELEGRAM_FILE_MAX_BYTES) throw new Error('download exceeded size cap');
+      chunks.push(c);
+    }
+    const incomingDir = path.join(entry.project, 'incoming');
+    fs.mkdirSync(incomingDir, { recursive: true });
+    const dest = path.join(incomingDir, fileName);
+    fs.writeFileSync(dest, Buffer.concat(chunks));
+    await reply(chatId, `📎 Saved to ${projectLabel(entry.project)}/incoming/${fileName}. Notifying the session…`);
+    routeToManaged(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`);
+  } catch (err) {
+    logError(`file upload failed chat=${chatId}: ${err.message}`);
+    await reply(chatId, `❌ Could not save the file: ${err.message}`);
+  }
+}
+
+/** List files in the attached project (shallow, cap 50). */
+function listProjectFiles(entry) {
+  try {
+    const names = fs.readdirSync(entry.project, { withFileTypes: true })
+      .filter((d) => d.isFile())
+      .map((d) => d.name)
+      .filter((n) => !n.startsWith('.'))
+      .slice(0, 50);
+    if (!names.length) return `No files in ${projectLabel(entry.project)}.`;
+    return `Files in ${projectLabel(entry.project)}:\n${names.map((n, i) => `${i + 1}. ${n}`).join('\n')}`;
+  } catch (err) {
+    return `Could not list files: ${err.message}`;
+  }
+}
+
+/** Send one project file back to Telegram (path-traversal safe). */
+async function sendProjectFile(chatId, nameArg) {
+  const entry = registry.attached(chatId);
+  if (!entry) {
+    await reply(chatId, 'No Claude session selected. Use /attach <name|number>.');
+    return;
+  }
+  const wanted = path.basename(String(nameArg || '').trim());
+  if (!wanted || wanted !== String(nameArg).trim()) {
+    await reply(chatId, '❌ Invalid file name (paths not allowed — see /files).');
+    return;
+  }
+  const full = path.join(entry.project, wanted);
+  try {
+    let st;
+    try {
+      st = fs.statSync(full);
+    } catch {
+      throw new Error(`file "${wanted}" not found (see /files)`);
+    }
+    if (!st.isFile()) {
+      throw new Error(`"${wanted}" is not a file`);
+    }
+    if (st.size > TELEGRAM_FILE_MAX_BYTES) {
+      throw new Error(`file too large (max ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024 / 1024)} MB)`);
+    }
+    await sendDocumentMultipart(chatId, full, wanted);
+  } catch (err) {
+    await reply(chatId, `❌ ${err.message}`);
+  }
+}
+
+/** Multipart sendDocument (Bot API file upload, shell-free). */
+function sendDocumentMultipart(chatId, filePath, fileName) {
+  return new Promise((resolve, reject) => {
+    const boundary = '----tgbridge' + Date.now();
+    const fileData = fs.readFileSync(filePath);
+    const part1 = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`,
+      'utf8',
+    );
+    const part2head = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      'utf8',
+    );
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+    const body = Buffer.concat([part1, part2head, fileData, tail]);
+    const { agent } = tg.state();
+    const req = require('https').request(
+      {
+        hostname: 'api.telegram.org',
+        path: `/bot${BOT_TOKEN}/sendDocument`,
+        method: 'POST',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+          'content-length': body.length,
+        },
+        agent: agent || undefined,
+        timeout: 120_000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            if (data.ok) resolve(data.result);
+            else reject(new Error(`sendDocument failed: ${data.description || res.statusCode}`));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Message handling
 // ---------------------------------------------------------------------------
 
@@ -407,6 +660,14 @@ async function handleMessage(msg) {
     logInfo(`rejected unauthorized user=${userId} chat=${chatId}`);
     return;
   }
+
+  // Documents: route to the attached managed session's project folder.
+  if (Array.isArray(msg.document) || (msg.document && typeof msg.document === 'object')) {
+    await handleFileUpload(chatId, msg.document);
+    return;
+  }
+
+  msgUserId = userId; // used by /new to stamp session ownership
 
   if (typeof msg.text !== 'string' || !msg.text.trim()) {
     logDebug(`chat=${chatId}: ignoring non-text message type`);
@@ -426,7 +687,16 @@ async function handleMessage(msg) {
     return;
   }
 
-  // Plain text => task for the active session.
+  // Plain text => task. Routing: if this chat is attached to a MANAGED
+  // session, the text goes there (interactive managed Claude); otherwise the
+  // legacy one-shot queue behavior applies.
+  const attached = registry.attached(chatId);
+  if (attached) {
+    routeToManaged(chatId, attached, text);
+    return;
+  }
+
+  // No managed session attached: legacy one-shot behavior.
   const active = store.active(chatId);
   const job = {
     sessionName: active.name,
@@ -463,11 +733,29 @@ async function dispatchCommand(chatId, parsed) {
       return;
 
     case 'new': {
+      // /new <name>            -> legacy one-shot chat session (unchanged)
+      // /new <name> <path>     -> managed Claude session bound to a project
+      const parts = String(arg || '').trim().split(/\s+/);
+      const maybePath = parts.length >= 2 ? parts[parts.length - 1] : null;
+      const isManaged = maybePath !== null;
+      const name = isManaged ? parts.slice(0, -1).join(' ') : arg;
+
+      if (isManaged) {
+        const created = claudeManager.createSession({ name, project: maybePath, owner: { userId: String(msgUserId || '') } });
+        if (!created.ok) {
+          await reply(chatId, `❌ ${created.error}`);
+          return;
+        }
+        claudeManager.attach(chatId, created.entry.id);
+        await reply(chatId, `✨ Managed session *${created.entry.name}* created for project ${projectLabel(created.entry.project)} and attached.\nSend any text to task it; /detach to release; /session-status for details.`);
+        return;
+      }
+
       // Snapshot-then-mutate-then-persist: if the save fails, the FULL chat
       // state (including any pre-existing session under this name) is restored
       // exactly — removing the entry alone would lose the old session.
       const snap = store.snapshotChat(String(chatId));
-      const created = store.create(chatId, arg);
+      const created = store.create(chatId, name);
       if (!created.ok) {
         await reply(chatId, `❌ ${created.error}`);
         return;
@@ -547,6 +835,84 @@ async function dispatchCommand(chatId, parsed) {
     case 'status':
       await reply(chatId, statusText(chatId));
       return;
+
+    // ------------------------- managed sessions -------------------------
+
+    case 'attach': {
+      if (!arg) {
+        await reply(chatId, 'Usage: /attach <name|number> (see /sessions)');
+        return;
+      }
+      const target = resolveSessionArg(arg);
+      if (!target) {
+        await reply(chatId, `No session "${arg}". Use /sessions to list.`);
+        return;
+      }
+      const r = claudeManager.attach(chatId, target.id);
+      if (!r.ok) {
+        await reply(chatId, `❌ ${r.error}`);
+        return;
+      }
+      await reply(chatId, `🔗 Attached to *${target.name}* (project: ${projectLabel(target.project)}).\nSend any text to task it; /detach to let go.`);
+      return;
+    }
+
+    case 'detach': {
+      const d = claudeManager.detach(chatId);
+      await reply(chatId, d.wasAttached ? '🔌 Detached. Plain text now uses the classic one-shot flow (/new <name>).' : 'Nothing to detach from.');
+      return;
+    }
+
+    case 'current': {
+      const cur = claudeManager.attached(chatId);
+      if (!cur) {
+        await reply(chatId, 'No Claude session selected.\nAvailable sessions:\n' + listNumbered(claudeManager.list()) + '\nUse /attach <name|number>');
+        return;
+      }
+      const st = claudeManager.status(cur.id);
+      await reply(chatId, formatSessionBlock(cur, st));
+      return;
+    }
+
+    case 'session-status': {
+      const cur = claudeManager.attached(chatId);
+      if (!cur) {
+        await reply(chatId, 'No Claude session selected. Use /attach <name|number>.');
+        return;
+      }
+      await reply(chatId, formatSessionStatus(claudeManager.status(cur.id)));
+      return;
+    }
+
+    case 'files': {
+      const cur = claudeManager.attached(chatId);
+      if (!cur) {
+        await reply(chatId, 'No Claude session selected. Use /attach <name|number>.');
+        return;
+      }
+      await reply(chatId, listProjectFiles(cur));
+      return;
+    }
+
+    case 'download': {
+      if (!arg) {
+        await reply(chatId, 'Usage: /download <filename> (see /files)');
+        return;
+      }
+      await sendProjectFile(chatId, arg);
+      return;
+    }
+
+    case 'discover': {
+      const procs = await discoverClaudeProcesses({});
+      if (!procs.length) {
+        await reply(chatId, 'No running Claude processes found (or discovery unavailable).');
+        return;
+      }
+      const lines = procs.map((p, i) => `${i + 1}. PID ${p.pid} — ${p.name}`);
+      await reply(chatId, `Running Claude processes (read-only inventory — the bridge never touches processes it does not own):\n${lines.join('\n')}\n\nTo control Claude from here, create a MANAGED session: /new <name> <project-path>`);
+      return;
+    }
 
     default:
       // Unknown command (not in BOT_COMMANDS): show help.
@@ -727,6 +1093,7 @@ function shutdown(signal) {
     }, 3000);
   }
   Promise.race([store.flush(), sleep(3000)]).then(() => { // 6-7.
+    claudeManager.stopAll(); // stop managed Claude processes; registry flushed
     logInfo('bye');
     process.exit(0);
   });
@@ -801,6 +1168,14 @@ module.exports = {
     advanceOffset,
     processUpdates,
     purgeBacklogIfFirstStart,
+    registry,
+    claudeManager,
+    resolveSessionArg,
+    listNumbered,
+    routeToManaged,
+    setManagedSpawnFn(fn) {
+      managedSpawnFn = fn;
+    },
     setStore(fake) {
       // Tests inject a store-backed stub (see test/bridge.test.js).
       Object.assign(store, fake);

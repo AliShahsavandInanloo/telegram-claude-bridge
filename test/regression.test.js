@@ -28,6 +28,18 @@ const { createOffsetStore } = require('../lib/offset');
 const bridge = require('../bridge.js');
 const T = bridge.__test;
 
+// Managed Claude sessions must NEVER spawn real processes in tests.
+T.setManagedSpawnFn(() => ({
+  pid: 99999,
+  exitCode: null,
+  signalCode: null,
+  stdin: { write: () => {}, on: () => {} },
+  stdout: { on: () => {} },
+  stderr: { on: () => {} },
+  on: () => {},
+  kill() {},
+}));
+
 let passed = 0;
 const failures = [];
 
@@ -1012,6 +1024,121 @@ function memOffsetStore(initialCommits = [], loadState = missingState) {
     const cmds = require('../lib/commands');
     assert.strictEqual(tg.safeSend, undefined, 'safeSend removed (unused abstraction)');
     assert.strictEqual(cmds.COMMAND_NAMES, undefined, 'COMMAND_NAMES removed (derive from BOT_COMMANDS)');
+  });
+
+  // ---------------- Claude Session Manager integration ----------------------
+
+  await test('session manager: /new <name> <path> creates + attaches a managed session', async () => {
+    const realTg = T.getTelegram();
+    const tgStub = fakeTg();
+    T.setTelegram(tgStub);
+    const proj = tmpDir();
+    try {
+      await T.handleMessage({ chat: { id: 930001 }, from: { id: 111 }, text: `/new NDS ${proj}` });
+      const replies = tgStub.calls.filter((c) => c.method === 'sendMessage').map((c) => c.params.text);
+      const last = replies[replies.length - 1] || '';
+      assert.ok(/Managed session \*NDS\* created/.test(last), `got: ${last}`);
+      const attached = T.registry.attached('930001');
+      assert.ok(attached, 'session attached to chat');
+      assert.strictEqual(attached.name, 'NDS');
+      assert.strictEqual(attached.project, path.resolve(proj));
+      // privacy: project path shown basename-only
+      assert.ok(!last.includes(proj), 'absolute project path must NOT be echoed');
+      assert.ok(last.includes('NDS'));
+    } finally {
+      T.setTelegram(realTg);
+    }
+  });
+
+  await test('session manager: plain text routes to the attached session (not the legacy queue)', async () => {
+    const realTg = T.getTelegram();
+    const tgStub = fakeTg();
+    T.setTelegram(tgStub);
+    const proj = tmpDir();
+    try {
+      await T.handleMessage({ chat: { id: 930002 }, from: { id: 111 }, text: `/new route-test ${proj}` });
+      // legacy runner must NOT receive it; managed routing must accept it
+      const realRun = T.claudeRunner.run;
+      const legacyJobs = [];
+      T.claudeRunner.run = async (c, j) => legacyJobs.push(j);
+      let routedText = null;
+      const realRoute = T.routeToManaged;
+      await T.handleMessage({ chat: { id: 930002 }, from: { id: 111 }, text: 'analyze the nodes' });
+      T.claudeRunner.run = realRun;
+      assert.strictEqual(legacyJobs.length, 0, 'legacy queue untouched for attached chats');
+      const entry = T.registry.attached('930002');
+      assert.ok(entry, 'still attached');
+    } finally {
+      T.setTelegram(realTg);
+    }
+  });
+
+  await test('session manager: unauthorized user cannot create or attach', async () => {
+    const realTg = T.getTelegram();
+    T.setTelegram(fakeTg());
+    const proj = tmpDir();
+    try {
+      const before = T.registry.list().length;
+      await T.handleMessage({ chat: { id: 930003 }, from: { id: 31337 }, text: `/new evil ${proj}` });
+      await T.handleMessage({ chat: { id: 930003 }, from: { id: 31337 }, text: '/attach 1' });
+      assert.strictEqual(T.registry.list().length, before, 'no registry entry created for unauthorized user');
+      assert.strictEqual(T.registry.attached('930003'), null, 'unauthorized attach rejected');
+    } finally {
+      T.setTelegram(realTg);
+    }
+  });
+
+  await test('session manager: /attach by number, /current, /detach round-trip', async () => {
+    const realTg = T.getTelegram();
+    const tgStub = fakeTg();
+    T.setTelegram(tgStub);
+    const proj = tmpDir();
+    try {
+      await T.handleMessage({ chat: { id: 930004 }, from: { id: 111 }, text: `/new alpha-rt ${proj}` });
+      await T.handleMessage({ chat: { id: 930004 }, from: { id: 111 }, text: '/detach' });
+      assert.strictEqual(T.registry.attached('930004'), null);
+      // attach by NUMBER from the /sessions menu for THIS chat's listing
+      const listed = T.listNumbered(T.claudeManager.list());
+      const idx = T.claudeManager.list().findIndex((e) => e.name === 'alpha-rt') + 1;
+      assert.ok(idx >= 1, 'session present in the numbered menu');
+      await T.handleMessage({ chat: { id: 930004 }, from: { id: 111 }, text: `/attach ${idx}` });
+      assert.ok(T.registry.attached('930004'), 'attach by number works');
+      await T.handleMessage({ chat: { id: 930004 }, from: { id: 111 }, text: '/current' });
+      const replies = tgStub.calls.filter((c) => c.method === 'sendMessage').map((c) => c.params.text);
+      const cur = replies[replies.length - 1] || '';
+      assert.ok(/Session: \*alpha-rt\*/.test(cur), `current shows session: ${cur}`);
+      assert.ok(!cur.includes(proj), 'no absolute path in /current');
+    } finally {
+      T.setTelegram(realTg);
+    }
+  });
+
+  await test('session manager: /download rejects path traversal and unknown files', async () => {
+    const realTg = T.getTelegram();
+    const tgStub = fakeTg();
+    T.setTelegram(tgStub);
+    const proj = tmpDir();
+    try {
+      await T.handleMessage({ chat: { id: 930005 }, from: { id: 111 }, text: `/new dl-test ${proj}` });
+      for (const evil of ['..\\..\\secret.txt', 'sub/dir/file.txt', 'nope-does-not-exist.txt']) {
+        const before = tgStub.calls.length;
+        await T.handleMessage({ chat: { id: 930005 }, from: { id: 111 }, text: `/download ${evil}` });
+        const replies = tgStub.calls.filter((c) => c.method === 'sendMessage').map((c) => c.params.text);
+        const last = replies[replies.length - 1] || '';
+        assert.ok(/Invalid|not a file|does not|not found/i.test(last) || last === '', `rejected: ${evil}`);
+        assert.ok(!tgStub.calls.slice(before).some((c) => c.method === 'sendDocument'), 'no document sent for invalid request');
+      }
+    } finally {
+      T.setTelegram(realTg);
+    }
+  });
+
+  await test('session manager: help lists the new commands', () => {
+    const { helpText } = require('../lib/commands');
+    const h = helpText('Bot');
+    for (const c of ['attach', 'detach', 'current', 'session-status', 'files', 'download', 'discover']) {
+      assert.ok(h.includes(`/${c}`), `help missing /${c}`);
+    }
   });
 
   // --------------------------------------------------------------------------

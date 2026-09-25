@@ -5,8 +5,8 @@
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",
-    "test": "node test/bridge.test.js && node test/regression.test.js",
-    "check": "node --check bridge.js && node --check lib/config.js && node --check lib/commands.js && node --check lib/proxy.js && node --check lib/sessions.js && node --check lib/queue.js && node --check lib/telegram.js && node --check lib/offset.js && node --check test/bridge.test.js && node --check test/regression.test.js"
+    "test": "node test/bridge.test.js && node test/regression.test.js && node test/claude-manager.test.js",
+    "check": "node --check bridge.js && node --check lib/config.js && node --check lib/commands.js && node --check lib/proxy.js && node --check lib/sessions.js && node --check lib/queue.js && node --check lib/telegram.js && node --check lib/offset.js && node --check lib/claude/registry.js && node --check lib/claude/launcher.js && node --check lib/claude/session.js && node --check lib/claude/manager.js && node --check lib/claude/output.js && node --check lib/claude/discover.js && node --check test/bridge.test.js && node --check test/regression.test.js && node --check test/claude-manager.test.js"
   },
   "engines": {
     "node": ">=18"
