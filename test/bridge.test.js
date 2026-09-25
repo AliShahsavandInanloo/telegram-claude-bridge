@@ -139,7 +139,7 @@ function lastSends(n = 1) {
     assert.strictEqual(new Set(names).size, names.length, 'no duplicates');
     assert.deepStrictEqual(
       new Set(names),
-      new Set(['start', 'help', 'new', 'sessions', 'use', 'attach', 'detach', 'current', 'session-status', 'files', 'download', 'discover', 'stop', 'queue', 'status'])
+      new Set(['start', 'help', 'new', 'sessions', 'use', 'attach', 'switch', 'detach', 'current', 'session-status', 'files', 'download', 'discover', 'stop', 'terminate-session', 'queue', 'status'])
     );
     for (const c of BOT_COMMANDS) assert.ok(c.description && c.description.length <= 256);
   });

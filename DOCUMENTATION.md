@@ -453,31 +453,95 @@ type state\offset.txt
 
 ## 13b. Claude Session Manager (managed sessions)
 
-Beyond one-shot jobs, the bridge can MANAGE long-lived Claude sessions end to
-end: it owns the process lifecycle, the working directory, stdin/stdout, and
-all session metadata.
+Beyond one-shot jobs, the bridge manages long-lived Claude sessions. There
+are two managed transports plus two non-attachable views:
 
-- **Registry** (`state/claude-sessions.json`, schema v1): `{id, name, project,
-  claudeSessionId, status, pid, createdAt, lastActivity, owner}` — atomic
-  writes, corruption backup, snapshot/restore rollback (same guarantees as the
-  legacy session store).
-- **Managed launcher** (`lib/claude/launcher.js`): spawns Claude with the same
-  launch-spec rules as one-shot mode (`{command, prefixArgs}`, `shell:false`,
-  argv-only — never a shell). Managed mode runs `--output-format stream-json
-  --input-format stream-json`: the user's task text is written to the child's
-  STDIN as one JSON line, so Telegram text can never reach a shell.
-- **Streaming** (`lib/claude/output.js`): progress messages are buffered,
-  grouped and rate-limited (≥ 15 s apart, size-capped); the final result is
-  always delivered.
-- **Files**: uploads land in `<project>/incoming/` and Claude is notified;
-  `/files` lists project files, `/download <name>` sends one back
-  (basename-only, path-traversal safe, 20 MB cap).
-- **Discovery** (`/discover`): read-only inventory of running Claude
-  processes (PID + image name via tasklist/ps). A discovered process is NOT a
-  managed session and is NOT attachable — the bridge never injects input into
-  processes it does not own.
-- `MANAGED_TASK_TIMEOUT_MS` (default 4 h) bounds a managed task; the process
-  is stopped and the chat notified.
+| Type | transport | Attachable | How it runs |
+|---|---|---|---|
+| **Channel session** | `channel` | yes, when connected | A real Claude Code session with the custom channel enabled; Telegram messages appear natively in the live conversation |
+| **stream-json session** | `stream-json` | yes (queued tasks) | A headless Claude process the bridge spawns and owns; legacy/automation transport |
+| Discovered process | — | **no** | `/discover` inventory of foreign Claude processes; never touched |
+| Legacy one-shot | — | n/a | `claude -p` per message via the classic store |
+
+### Channel sessions (native Claude Code integration)
+
+A **Channel** is Claude Code's mechanism for pushing events into a running
+session (research preview): an MCP server that declares
+`capabilities.experimental['claude/channel']`, emits
+`notifications/claude/channel` (delivered as `<channel source=… chat_id=…>`
+and rendered `← source · message`), and exposes ordinary MCP tools for
+replies. Verified against the official docs (code.claude.com/docs/en/channels)
+and Claude Code 2.1.267.
+
+This repo ships that channel server: `lib/channel/claude-channel.js`. It is
+spawned BY Claude Code (stdio MCP subprocess) and connects to the Bridge's
+**channel hub** — an authenticated, framed-JSON TCP server bound strictly to
+127.0.0.1 (never 0.0.0.0), with heartbeats and auto-reconnect.
+
+**How a Telegram message reaches the live session:**
+
+```text
+Telegram → Bridge (sole getUpdates consumer, allowlist enforced)
+         → hub.deliver(session, {content, meta:{chat_id,…}})   (localhost IPC, auth'd)
+         → channel server: mcp.notification(notifications/claude/channel)
+         → appears in the Claude Code session as ← telegram-bridge · <text>
+Claude replies with the reply tool → hub validates session↔chat mapping
+         → Bridge sends via the existing Telegram client (chunking, errors)
+```
+
+**Starting a Channel-enabled session** (research preview requires the dev
+flag; custom channels are not yet on Anthropic's allowlist):
+
+1. One-time: register the channel in the project's `.mcp.json`:
+   ```json
+   { "mcpServers": { "telegram-bridge": {
+       "command": "node",
+       "args": ["<bridge>\\lib\\channel\\claude-channel.js"] } } }
+   ```
+2. Export the hub coordinates (shown in the bridge log at startup):
+   `CLAUDE_CHANNEL_PORT=<port>` and `CLAUDE_CHANNEL_SECRET=<contents of
+   state/channel-secret>`.
+3. `claude --dangerously-load-development-channels server:telegram-bridge`
+   and accept the development-channels prompt.
+
+The channel authenticates with the hub secret (random 32-byte value in
+`state/channel-secret`, mode 0600). It is NOT the bot token, NOT an API key,
+and never leaves the machine. The Bridge validates every `reply`/`send_file`
+call against the session↔chat attachment mapping — the channel cannot
+message a chat its session is not attached to, and cannot bypass the
+allowlist or size caps.
+
+**Registration/reconnect identity:** the channel instance identifies itself
+with a UUID (`clientId`), never a filesystem path. A reconnect with the same
+clientId re-binds to the same registry record (no duplicates); a new clientId
+for an offline same-name+project record reuses it; otherwise a new session
+registers. Disconnects mark the session offline; attachments persist but are
+inactive until reconnect. `/attach` and `/switch` refuse offline Channel
+sessions instead of falling back silently.
+
+### Legacy stream-json managed sessions
+
+`/new <name> <project-path>` (without a running channel) spawns a headless
+Claude via `--output-format stream-json --input-format stream-json`: tasks
+are queued FIFO, each queued task resolves with its own final result, output
+streams to Telegram rate-limited, `MANAGED_TASK_TIMEOUT_MS` (default 4 h)
+applies. Registry entries record `transport` so `/sessions` can show which
+sessions are Channel vs stream-json. `/stop` never kills a Channel session
+(only Bridge-side work); `/terminate-session confirm` explicitly stops a
+stream-json process.
+
+### Files
+
+Uploads land in `<project>/incoming/` and Claude is notified (channel event
+for Channel sessions, task prompt for stream-json). `/files` lists project
+files; `/download <name>` and the channel `send_file` tool share the same
+path-safety logic: basename-only (traversal/symlink-safe), 20 MB cap.
+
+### Discovery
+
+`/discover` is a read-only inventory of running Claude processes (PID +
+image name via tasklist/ps, spawned shell:false). A discovered process is
+NOT attachable — only sessions with an authenticated Channel connection are.
 
 ## 14. Extending the bridge
 

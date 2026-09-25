@@ -70,31 +70,42 @@ route, and how many users are authorized.
 | `/new <name> <project-path>` | create a **managed Claude session** bound to a project and attach to it |
 | `/sessions` | list sessions; `▶️` marks the active one, `(new)` = not yet used by Claude |
 | `/use <name>` | switch the active one-shot session |
-| `/attach <name\|number>` | attach this chat to a managed session |
+| `/attach <name\|number>` | attach this chat to an **online Channel session** (offline targets are refused, never silently substituted) |
+| `/switch <name\|number>` | switch this chat to another connected Channel session |
 | `/detach` | detach from the managed session |
 | `/current` | show the currently attached managed session |
 | `/session-status` | process state, current task, runtime, latest output |
 | `/files` | list files in the attached project |
 | `/download <file>` | send a project file back here |
 | `/discover` | list running Claude processes (read-only inventory — never attachable) |
-| `/stop` | cancel the running job (if it belongs to this chat) and clear this chat's queued jobs |
+| `/stop` | cancel Bridge-side work for this chat (queued jobs, one-shot job). **Channel sessions keep running** — use `/terminate-session confirm` for that |
+| `/terminate-session confirm` | explicitly stop a stream-json session process |
 | `/queue` | what's running and how many jobs are queued (this chat / global) |
 | `/status` | Claude executable, active session, job state, queue, proxy (credentials redacted), uptime |
 | any other text | a task for the attached managed session — or, if none, the one-shot active session |
 
 ### Managed vs one-shot sessions
 
-- **One-shot** (classic): each message spawns `claude -p <text>` against a named
-  conversation; the process ends when the answer is done.
-- **Managed**: `/new <name> <project-path>` registers a session the bridge fully
-  owns — project directory, Claude process lifecycle, stdin/stdout protocol and
-  metadata (`state/claude-sessions.json`). Attach with `/attach`, then messages
-  stream incremental progress (rate-limited, no spam) and the final report.
-  Files uploaded to the chat land in `<project>/incoming/` and Claude is
-  notified; `/download` returns project files.
+- **Channel sessions (preferred, interactive)**: start Claude Code in a project
+  with the custom channel enabled — messages from Telegram appear natively in
+  the live session (`← telegram-bridge · …`) and Claude replies through the
+  `reply` tool. See DOCUMENTATION.md §Channel for the exact setup.
+- **stream-json sessions (legacy/automation)**: `/new <name> <project-path>`
+  registers a session the bridge fully owns; each message is a queued task
+  via the stream-json stdin protocol. Kept for background/automation use.
+- **One-shot** (classic): each message spawns `claude -p <text>` against a
+  named conversation; the process ends when the answer is done.
 - **Discovered processes**: `/discover` lists Claude processes already running
-  on the machine. These are inventory only — the bridge never injects input
-  into processes it does not own, so they are not attachable.
+  on the machine. Inventory only — not attachable (a session is attachable
+  only when its Channel connection is online).
+
+### Claude → Telegram via the Bridge
+
+Channel sessions never talk to Telegram directly. Claude calls the Bridge's
+`reply`/`send_file` tools over the authenticated localhost IPC; the Bridge
+validates the session→chat mapping, applies the allowlist/chunking/size caps,
+and sends with the single Telegram client. The channel secret lives in
+`state/channel-secret` (0600) and is never the bot token or any API credential.
 
 Commands also work group-style: `/status@YourBot` is accepted, and commands
 addressed to a different bot are ignored.

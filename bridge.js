@@ -41,6 +41,9 @@ const { createRegistry } = require('./lib/claude/registry');
 const { createClaudeManager } = require('./lib/claude/manager');
 const { createProgressReporter } = require('./lib/claude/output');
 const { discoverClaudeProcesses } = require('./lib/claude/discover');
+const { createChannelHub } = require('./lib/channel/hub');
+const { createIpcServer } = require('./lib/channel/ipc');
+const { spawn: spawnRaw } = require('child_process');
 const {
   parseAllowlist,
   intEnv,
@@ -139,6 +142,27 @@ const MANAGED_TASK_TIMEOUT_MS = taskTimeoutCheck.value;
 const PROGRESS_MIN_INTERVAL_MS = 15_000; // anti-spam: >= 15 s between progress sends
 const TELEGRAM_FILE_MAX_BYTES = 20 * 1024 * 1024; // Bot API download cap for this bridge
 
+// Channel hub secret: random per bridge install, stored 0600 in the state dir.
+// NEVER the bot token or any API credential.
+const CHANNEL_SECRET_FILE = path.join(STATE_DIR, 'channel-secret');
+function loadOrCreateChannelSecret() {
+  try {
+    const existing = fs.readFileSync(CHANNEL_SECRET_FILE, 'utf8').trim();
+    if (existing.length >= 32) return existing;
+  } catch {
+    /* first run */
+  }
+  const secret = require('crypto').randomBytes(32).toString('hex');
+  try {
+    fs.writeFileSync(CHANNEL_SECRET_FILE, secret + '\n', { mode: 0o600 });
+  } catch (err) {
+    failStartup(`cannot write channel secret: ${err.message}`);
+  }
+  return secret;
+}
+const CHANNEL_SECRET = loadOrCreateChannelSecret();
+let hubPort = 0; // set when the channel hub starts listening
+
 const dirCheck = ensureWritableDir(STATE_DIR);
 if (!dirCheck.ok) failStartup(dirCheck.error);
 
@@ -170,6 +194,25 @@ const claudeManager = createClaudeManager({
   logInfo,
   logError: logError,
 });
+
+// Channel hub: authenticated localhost IPC for Channel-enabled Claude sessions.
+const channelHub = createChannelHub({ reg: registry, secret: CHANNEL_SECRET, logInfo, logWarn });
+
+/**
+ * Deliver a Telegram message to a Channel session as a channel event (the
+ * message appears natively in the live Claude Code conversation), falling
+ * back to the legacy stream-json task path for stream-json sessions.
+ */
+function deliverToSession(chatId, entry, text, extraMeta = {}) {
+  registry.touch(entry.id);
+  if (entry.transport === 'channel' && channelHub.isOnline(entry.id)) {
+    return channelHub.deliver(entry.id, {
+      content: text,
+      meta: { chat_id: String(chatId), from: 'telegram', user_id: String(msgUserId || ''), ...extraMeta },
+    });
+  }
+  return { ok: false, error: 'session_offline' };
+}
 
 // ---------------------------------------------------------------------------
 // Bounded stream capture (never let a chatty child consume memory)
@@ -445,9 +488,11 @@ function listNumbered(entries) {
 
 function formatSessionBlock(entry, st) {
   const p = st ? st.process : { running: false, pid: null, busy: false };
+  const conn = entry.transport === 'channel' ? (channelHub.isOnline(entry.id) ? 'connected' : 'offline') : null;
   return [
     `Session: *${entry.name}*`,
     `Project: ${projectLabel(entry.project)}`,
+    `Transport: ${entry.transport}${conn ? ` (${conn})` : ''}`,
     `Status: ${p.running ? (p.busy ? 'running (busy)' : 'idle') : 'stopped'}`,
     p.pid ? `PID: ${p.pid}` : null,
   ].filter(Boolean).join('\n');
@@ -470,8 +515,31 @@ function formatSessionStatus(st) {
   return lines.join('\n');
 }
 
-/** Route a chat message into its attached managed session (with streaming). */
+/**
+ * Route a chat message into its attached session.
+ *
+ * Channel sessions (transport 'channel', online): the message is delivered
+ * through the custom Claude Code Channel and appears natively in the live
+ * session — Claude answers via the reply tool, which comes back through the
+ * hub and is sent to the originating chat. No timeout/queue machinery here.
+ *
+ * Legacy stream-json sessions: the original submitTask path with streaming
+ * progress and a hard task timeout.
+ */
 function routeToManaged(chatId, entry, text) {
+  if (entry.transport === 'channel') {
+    if (!channelHub.isOnline(entry.id)) {
+      reply(chatId, `⚠️ *${entry.name}* is a Channel session but is currently offline.\nStart Claude Code in that project with the channel enabled (see DOCUMENTATION.md §Channel), then it will reconnect automatically.`).catch(() => {});
+      return;
+    }
+    const r = deliverToSession(chatId, entry, text);
+    if (!r.ok) {
+      reply(chatId, `❌ Could not deliver to *${entry.name}* (${r.error}).`).catch(() => {});
+    }
+    return;
+  }
+
+  // ---- legacy stream-json managed session --------------------------------
   const reporter = createProgressReporter({
     send: (t) => reply(chatId, `⚙️ *${entry.name}*\n${t}`),
     minIntervalMs: PROGRESS_MIN_INTERVAL_MS,
@@ -496,7 +564,7 @@ function routeToManaged(chatId, entry, text) {
         reply(chatId, `❌ *${entry.name}*: ${result.summary || 'task failed'}`).catch(() => {});
         return;
       }
-      if (result.queued) return; // reported via onQueued
+      if (result.queued) return; // queued tasks report via their own completion
       reporter.complete(result.summary || `Done in ${formatUptime(Math.floor((result.runtimeMs || 0) / 1000))}.`);
     })
     .catch((err) => {
@@ -543,7 +611,13 @@ async function handleFileUpload(chatId, document) {
     const dest = path.join(incomingDir, fileName);
     fs.writeFileSync(dest, Buffer.concat(chunks));
     await reply(chatId, `📎 Saved to ${projectLabel(entry.project)}/incoming/${fileName}. Notifying the session…`);
-    routeToManaged(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`);
+    // Channel sessions get a channel event with safe metadata (no file
+    // contents inlined); stream-json sessions get a task prompt.
+    if (entry.transport === 'channel' && channelHub.isOnline(entry.id)) {
+      deliverToSession(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`, { file_path: `incoming/${fileName}` });
+    } else {
+      routeToManaged(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`);
+    }
   } catch (err) {
     logError(`file upload failed chat=${chatId}: ${err.message}`);
     await reply(chatId, `❌ Could not save the file: ${err.message}`);
@@ -772,18 +846,54 @@ async function dispatchCommand(chatId, parsed) {
     }
 
     case 'sessions': {
-      const names = store.names(chatId);
-      const active = store.active(chatId);
-      if (!names.length) {
-        await reply(chatId, 'No sessions yet. Use /new <name>.');
+      // Unified view: managed sessions (channel/stream-json) first, then the
+      // legacy one-shot store sessions for this chat.
+      const managed = claudeManager.list();
+      const attachedId = (registry.attached(chatId) || {}).id;
+      const lines = [];
+      managed.forEach((e, i) => {
+        const flag = e.id === attachedId ? '▶️' : '  ';
+        const conn = e.transport === 'channel' ? (channelHub.isOnline(e.id) ? 'Channel: connected' : 'Channel: offline') : 'transport: stream-json';
+        lines.push(`${flag} ${i + 1}. *${e.name}*\n     ${conn} · Project: ${projectLabel(e.project)}`);
+      });
+      const legacyNames = store.names(chatId);
+      if (legacyNames.length) {
+        const active = store.active(chatId);
+        lines.push('', 'One-shot sessions:');
+        for (const n of legacyNames) {
+          const s = store.get(chatId, n);
+          const flag = n === active.name ? '▶️' : '  ';
+          lines.push(`${flag} *${n}*${s.initialized ? '' : ' (new)'}`);
+        }
+      }
+      if (!lines.length) {
+        await reply(chatId, 'No sessions yet. Create one with /new <name> <project-path>.');
         return;
       }
-      const lines = names.map((n) => {
-        const s = store.get(chatId, n);
-        const flag = n === active.name ? '▶️' : '  ';
-        return `${flag} *${n}*${s.initialized ? '' : ' (new)'}`;
-      });
       await reply(chatId, `Sessions:\n${lines.join('\n')}`);
+      return;
+    }
+
+    case 'switch': {
+      if (!arg) {
+        await reply(chatId, 'Usage: /switch <name|number> (see /sessions)');
+        return;
+      }
+      const target = resolveSessionArg(arg);
+      if (!target) {
+        await reply(chatId, `No session "${arg}". Use /sessions to list.`);
+        return;
+      }
+      if (target.transport === 'channel' && !channelHub.isOnline(target.id)) {
+        await reply(chatId, `⚠️ *${target.name}* is offline right now. Start Claude Code in that project with the channel enabled, then /switch again.\nNot switching to a different session.`);
+        return;
+      }
+      const r = claudeManager.attach(chatId, target.id);
+      if (!r.ok) {
+        await reply(chatId, `❌ ${r.error}`);
+        return;
+      }
+      await reply(chatId, `🔀 Switched to *${target.name}* (${projectLabel(target.project)}). Next messages go there.`);
       return;
     }
 
@@ -810,13 +920,40 @@ async function dispatchCommand(chatId, parsed) {
     }
 
     case 'stop': {
+      // /stop is scoped by transport: for Channel sessions it only cancels
+      // Bridge-side work — the interactive Claude Code process is NEVER killed
+      // here (use /terminate-session for that).
       const removed = queue.clearChat(chatId);
       let cancelNote = 'no running job in this chat';
       if (currentRun && currentRun.chatId === chatId && !currentRun.cancelled) {
         currentRun.cancel('stopped by /stop');
         cancelNote = `running job *${currentRun.job.sessionName}* cancelled`;
       }
-      await reply(chatId, `🛑 ${cancelNote}; ${removed} queued job(s) removed.`);
+      let channelNote = '';
+      const att = registry.attached(chatId);
+      if (att && att.transport === 'channel') {
+        channelNote = ' Channel session left running (use /terminate-session to stop it).';
+      }
+      await reply(chatId, `🛑 ${cancelNote}; ${removed} queued job(s) removed.${channelNote}`);
+      return;
+    }
+
+    case 'terminate-session': {
+      const cur = registry.attached(chatId);
+      if (!cur) {
+        await reply(chatId, 'No session attached.');
+        return;
+      }
+      if (cur.transport !== 'stream-json') {
+        await reply(chatId, `⚠️ *${cur.name}* is a Channel session. /stop never kills it — /terminate-session stops the Claude Code process. Send /terminate-session confirm to proceed.`);
+        return;
+      }
+      if (arg !== 'confirm') {
+        await reply(chatId, `Send /terminate-session confirm to stop *${cur.name}*'s Claude process.`);
+        return;
+      }
+      claudeManager.stopSession(cur.id, 'terminated by /terminate-session');
+      await reply(chatId, `🛑 Stopped the stream-json process for *${cur.name}*. The registry entry remains for restart.`);
       return;
     }
 
@@ -848,12 +985,16 @@ async function dispatchCommand(chatId, parsed) {
         await reply(chatId, `No session "${arg}". Use /sessions to list.`);
         return;
       }
+      if (target.transport === 'channel' && !channelHub.isOnline(target.id)) {
+        await reply(chatId, `⚠️ *${target.name}* is a Channel session but is currently OFFLINE.\nStart Claude Code in that project with the channel enabled, then try again.\n(Not falling back to another session.)`);
+        return;
+      }
       const r = claudeManager.attach(chatId, target.id);
       if (!r.ok) {
         await reply(chatId, `❌ ${r.error}`);
         return;
       }
-      await reply(chatId, `🔗 Attached to *${target.name}* (project: ${projectLabel(target.project)}).\nSend any text to task it; /detach to let go.`);
+      await reply(chatId, `🔗 Attached to *${target.name}* (${projectLabel(target.project)}).\nSend any text — it appears live in that Claude Code session; /detach to let go.`);
       return;
     }
 
@@ -870,7 +1011,9 @@ async function dispatchCommand(chatId, parsed) {
         return;
       }
       const st = claudeManager.status(cur.id);
-      await reply(chatId, formatSessionBlock(cur, st));
+      const conn = cur.transport === 'channel' ? (channelHub.isOnline(cur.id) ? 'connected' : 'offline') : 'n/a (stream-json)';
+      const base = formatSessionBlock(cur, st);
+      await reply(chatId, `${base}\nTransport: ${cur.transport}\nChannel: ${conn}\nLast activity: ${cur.lastActivity || 'unknown'}`);
       return;
     }
 
@@ -1093,7 +1236,8 @@ function shutdown(signal) {
     }, 3000);
   }
   Promise.race([store.flush(), sleep(3000)]).then(() => { // 6-7.
-    claudeManager.stopAll(); // stop managed Claude processes; registry flushed
+    channelHub.close();
+    claudeManager.stopAll(); // stop managed stream-json processes; registry flushed
     logInfo('bye');
     process.exit(0);
   });
@@ -1108,6 +1252,47 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 if (require.main === module) (async () => {
   logInfo(`starting bridge; claude=${claudeDisplay}; state dir=${STATE_DIR}`);
+
+  // Channel hub: authenticated localhost IPC for Channel-enabled sessions.
+  channelHub.onChannelMessage((entry, { content, meta }) => {
+    // Inbound channel events are Bridge-gated already (only authenticated
+    // channel connections reach here); log at debug level.
+    logDebug(`channel event from ${entry.name}: ${String(content).length}B meta=${JSON.stringify(Object.keys(meta || {}))}`);
+  });
+  channelHub.onChannelTool(async (entry, tool, args) => {
+    if (tool === 'reply') {
+      const chatId = String(args.chat_id || '');
+      if (!chatId || !/^-?\d+$/.test(chatId)) throw new Error('invalid chat_id');
+      // Validate the mapping: the session must be attached to this chat.
+      const attached = registry.attached(chatId);
+      if (!attached || attached.id !== entry.id) {
+        throw new Error('session is not attached to that chat');
+      }
+      await reply(chatId, String(args.text || '')); // existing chunking/error handling
+      return { sent: true };
+    }
+    if (tool === 'send_file') {
+      const chatId = String(args.chat_id || '');
+      if (!chatId || !/^\d+$/.test(chatId)) throw new Error('invalid chat_id');
+      const attached = registry.attached(chatId);
+      if (!attached || attached.id !== entry.id) {
+        throw new Error('session is not attached to that chat');
+      }
+      // Reuse /download path-safety logic (basename-only, size cap).
+      const wanted = path.basename(String(args.file_path || '').trim());
+      const full = path.join(entry.project, wanted);
+      const st = fs.statSync(full);
+      if (!st.isFile()) throw new Error('not a file');
+      if (st.size > TELEGRAM_FILE_MAX_BYTES) throw new Error(`file too large (max ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024 / 1024)} MB)`);
+      await sendDocumentMultipart(chatId, full, wanted);
+      return { sent: true, file: wanted };
+    }
+    throw new Error(`unknown tool: ${tool}`);
+  });
+  channelHub.listen(({ port }) => {
+    hubPort = port;
+    logInfo(`channel hub ready on 127.0.0.1:${port} (secret: state/channel-secret)`);
+  });
   logInfo(`allowlist: ${ALLOWED.size} authorized user(s); backlog on first start: ${PROCESS_INITIAL_BACKLOG ? 'process' : 'skip'}`);
 
   let me = null;
