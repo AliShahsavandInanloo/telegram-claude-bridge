@@ -88,12 +88,24 @@ migrated automatically.
 
 ## Message delivery
 
-Updates are processed **at-most-once**: the next Telegram offset is saved
-before an update is handled, so a command can be skipped after a crash but
-never executed twice. On the **first** start, messages sent while the bridge
-was offline are skipped by default (`PROCESS_INITIAL_BACKLOG=false`) instead
-of executing stale commands; set it to `true` to consume the backlog. Later
-restarts resume from the saved offset.
+Updates are processed **at-most-once**: the next Telegram offset is durably
+persisted (temp file + fsync + rename) **before** an update is handled, so a
+command can be skipped after a crash but never executed twice.
+
+- **If offset persistence fails, the command is not executed.** The bridge
+  logs the failure, keeps its offset unchanged, and retries — the same update
+  is delivered again on the next poll. It never acknowledges success without
+  a durable save.
+- On the **first** start, messages sent while the bridge was offline are
+  skipped by default (`PROCESS_INITIAL_BACKLOG=false`) instead of executing
+  stale commands; set it to `true` to consume the backlog. **First
+  initialization records state even when the backlog is empty** — a restart
+  is never mistaken for another first start (which would purge new messages).
+- Corrupted or unreadable offset state is **not** treated as a clean first
+  start: the bridge backs up the corrupt file and refuses to start rather
+  than risk discarding pending commands.
+
+Later restarts resume from the saved offset.
 
 ## Tests
 
@@ -101,16 +113,28 @@ restarts resume from the saved offset.
 npm test
 ```
 
-52 sandboxed tests cover auth, prompt passing, session lifecycle, queue
-fairness and close semantics, proxy parsing/redaction, atomic persistence,
-first-start backlog skipping, at-most-once offset ordering, Windows `.cmd`
-shim handling, and `/status` privacy. No network or `claude` process is touched.
+78 sandboxed tests (30 + 48) cover auth, prompt passing, session lifecycle,
+queue fairness and close semantics, proxy parsing/redaction, atomic
+persistence, first-start backlog skipping (empty and non-empty), at-most-once
+offset ordering incl. persistence-failure blocking, offset state categories
+(missing/valid/corrupt/unreadable), the Windows launch specification
+(native exe, npm `.cmd`/`.bat` shims → node + cli.js, JS entrypoints, and
+hard failures for anything unparseable), spawn-argv verification
+(`shell:false`, prefix order, `--resume`), session rollback on failed saves,
+structure-based legacy migration, temp-file cleanup, and `/status` privacy.
+No network or `claude` process is touched.
 
 ## Troubleshooting
 
 - `refusing to start: ALLOWED_TELEGRAM_IDS …` → set your numeric ID(s) in `.env`.
-- `refusing to start: … .cmd shim …` → point `CLAUDE_BIN` at the native `claude.exe`
-  (npm installs a `claude.cmd` shim that cannot be safely spawned without a shell).
+- `refusing to start: … .cmd launcher …` → the npm `claude.cmd` shim could not be
+  safely modeled; point `CLAUDE_BIN` at the native `claude.exe` or the CLI's
+  `cli.js` (see DOCUMENTATION.md §CLAUDE_BIN).
+- `refusing to start: CLAUDE_BIN "…" was not found on PATH` → the bare name
+  matches nothing executable; install Claude Code or set `CLAUDE_BIN`.
+- `Unable to read Telegram offset state … refusing to treat this as first startup`
+  → `state/offset.txt` is corrupt or unreadable; a `.corrupt-*.bak` backup was
+  written next to it. Inspect/restore it, then start the bridge again.
 - `cannot reach Telegram yet` repeating → your VPN is off; turn it on, the bridge
   re-probes within 10 s. Or pin `TELEGRAM_PROXY_URL`.
 - 401 from Telegram → wrong `TELEGRAM_BOT_TOKEN`.

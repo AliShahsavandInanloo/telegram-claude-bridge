@@ -44,7 +44,7 @@ const {
   validateBotToken,
   ensureWritableDir,
   validateBridgeCwd,
-  resolveClaudeBin,
+  resolveClaudeLaunch,
   applyEnvFile,
   safeClaudeLabel,
 } = require('./lib/config');
@@ -128,9 +128,10 @@ const OFFSET_FILE = path.join(STATE_DIR, 'offset.txt');
 const dirCheck = ensureWritableDir(STATE_DIR);
 if (!dirCheck.ok) failStartup(dirCheck.error);
 
-const claudeCheck = resolveClaudeBin(process.env.CLAUDE_BIN || 'claude');
-if (!claudeCheck.ok) failStartup(`${claudeCheck.error}. Set CLAUDE_BIN to the full path of the native claude executable.`);
-const claudeDisplay = safeClaudeLabel(claudeCheck.resolved); // basename only — no paths over Telegram
+const claudeCheck = resolveClaudeLaunch(process.env.CLAUDE_BIN || 'claude');
+if (!claudeCheck.ok) failStartup(claudeCheck.error);
+const CLAUDE_LAUNCH = { command: claudeCheck.command, prefixArgs: claudeCheck.prefixArgs };
+const claudeDisplay = safeClaudeLabel(claudeCheck.prefixArgs.length ? claudeCheck.prefixArgs[0] : claudeCheck.command); // basename only — no paths over Telegram
 
 const cwdCheck = validateBridgeCwd(process.env.BRIDGE_CWD || ROOT);
 if (!cwdCheck.ok) failStartup(cwdCheck.error);
@@ -207,7 +208,7 @@ function runClaudeJob(chatId, job, { spawnFn = spawn } = {}) {
     const stdoutCap = boundedCapture(MAX_STDOUT_BYTES);
     const stderrCap = boundedCapture(MAX_STDERR_BYTES);
 
-    const child = spawnFn(claudeCheck.resolved, args, {
+    const child = spawnFn(CLAUDE_LAUNCH.command, [...CLAUDE_LAUNCH.prefixArgs, ...args], {
       cwd: job.cwd,
       env: process.env, // inherits ANTHROPIC_BASE_URL / provider relay config
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -271,11 +272,19 @@ function runClaudeJob(chatId, job, { spawnFn = spawn } = {}) {
 
         let persistError = null;
         if (code === 0 && !cancelled) {
-          // Session is now real on Claude's side; future jobs resume it.
+          // Session is now real on Claude's side. Policy: mark initialized and
+          // persist; if persistence FAILS the initialized flag is rolled back
+          // (targeted — unrelated session changes made while the job ran are
+          // kept) so the next job re-creates the session with --session-id
+          // instead of blindly resuming state that was never durably recorded.
+          const entryBefore = store.get(chatId, job.sessionName);
+          const prevInit = entryBefore && entryBefore.id === job.sessionId ? entryBefore.initialized : undefined;
           store.markInitialized(chatId, job.sessionId);
           try {
             await store.save();
           } catch (err) {
+            const e = store.get(chatId, job.sessionName);
+            if (e && e.id === job.sessionId && prevInit !== undefined) e.initialized = prevInit;
             persistError = err;
             logWarn(`could not persist session state: ${err.message}`);
           }
@@ -454,6 +463,10 @@ async function dispatchCommand(chatId, parsed) {
       return;
 
     case 'new': {
+      // Snapshot-then-mutate-then-persist: if the save fails, the FULL chat
+      // state (including any pre-existing session under this name) is restored
+      // exactly — removing the entry alone would lose the old session.
+      const snap = store.snapshotChat(String(chatId));
       const created = store.create(chatId, arg);
       if (!created.ok) {
         await reply(chatId, `❌ ${created.error}`);
@@ -462,8 +475,7 @@ async function dispatchCommand(chatId, parsed) {
       try {
         await store.save();
       } catch (err) {
-        // Roll back the in-memory mutation; never claim success.
-        store.remove(chatId, created.name);
+        store.restoreChat(String(chatId), snap);
         await reply(chatId, `❌ Could not create session (failed to save): ${err.message}`);
         return;
       }
@@ -492,7 +504,7 @@ async function dispatchCommand(chatId, parsed) {
         await reply(chatId, 'Usage: /use <name>');
         return;
       }
-      const previous = store.active(chatId).name;
+      const snap = store.snapshotChat(String(chatId));
       const res = store.setActive(chatId, arg);
       if (!res.ok) {
         await reply(chatId, `No session named *${arg}*. Use /sessions to list.`);
@@ -501,7 +513,7 @@ async function dispatchCommand(chatId, parsed) {
       try {
         await store.save();
       } catch (err) {
-        store.setActive(chatId, previous); // roll back
+        store.restoreChat(String(chatId), snap); // roll back active selection
         await reply(chatId, `❌ Could not switch session (failed to save): ${err.message}`);
         return;
       }
@@ -557,32 +569,64 @@ async function dispatchCommand(chatId, parsed) {
  * THE single place the update offset advances. Commits the next offset to
  * disk BEFORE the caller handles the update — deliberate AT-MOST-ONCE
  * semantics (see header comment). `osImpl` injectable for tests.
+ *
+ * If the durable commit FAILS this throws: the caller must not handle the
+ * update and must not advance its in-memory offset, so a restart (or the
+ * polling retry) re-delivers the same update instead of executing a command
+ * whose offset was never persisted. False "success" would break at-most-once.
  */
 function advanceOffset(current, updateId, osImpl = offsetStore) {
   const next = Math.max(current, updateId + 1);
-  osImpl.commit(next); // intentionally before handling (at-most-once)
+  let persisted = false;
+  try {
+    persisted = Boolean(osImpl.commit(next));
+  } catch (err) {
+    throw new Error(`Failed to persist Telegram offset ${next}: ${err.message}`);
+  }
+  if (!persisted) {
+    throw new Error(`Failed to persist Telegram offset ${next}; update NOT handled (at-most-once)`);
+  }
   return next;
 }
 
 /**
  * Backlog policy at startup.
  *
- * - Persisted offset exists  -> resume normally from it (never purge).
- * - No offset (first start)  -> PROCESS_INITIAL_BACKLOG=false (default):
- *   fetch once with offset = -1; Telegram's documented behavior is to skip
- *   all pending updates and return only the most recent one, moving the
- *   cursor past historical messages so offline commands are NOT executed.
- *   With PROCESS_INITIAL_BACKLOG=true the backlog is consumed normally.
+ * Offset-state semantics (from the offset store's categorized load()):
+ * - missing  -> true first-ever start: PROCESS_INITIAL_BACKLOG=false (default)
+ *   fetches once with offset = -1; Telegram's documented behavior is to skip
+ *   all pending updates and return only the most recent one. The resulting
+ *   state is then persisted — even when the backlog was EMPTY — so a restart
+ *   is never mistaken for another first start (which would purge new
+ *   messages). With PROCESS_INITIAL_BACKLOG=true the backlog is consumed
+ *   normally and offset 0 is persisted as the initialization marker.
+ * - corrupt / unreadable -> NOT first start. Refusing to treat corrupted
+ *   state as "never persisted" is essential: doing so would purge the
+ *   Telegram backlog and silently discard pending commands. The store backs
+ *   the corrupt file up; startup fails with an actionable error instead.
+ * - valid    -> resume normally from the persisted offset (never purge).
  */
 async function purgeBacklogIfFirstStart({ osImpl = offsetStore, tgImpl = tg } = {}) {
-  const persisted = osImpl.load();
-  if (persisted !== null) {
-    logInfo(`resuming from persisted Telegram offset ${persisted}`);
-    return persisted;
+  const loaded = osImpl.load();
+  const persisted = loaded && typeof loaded === 'object' && 'state' in loaded
+    ? loaded
+    : { state: loaded === null || loaded === undefined ? 'missing' : 'valid', offset: loaded }; // legacy stubs
+  if (persisted.state === 'corrupt' || persisted.state === 'unreadable') {
+    throw new Error(
+      `Unable to read Telegram offset state (${persisted.state}${persisted.error ? `: ${persisted.error.message}` : ''}). ` +
+      'Refusing to treat this as first startup because doing so could discard pending updates. ' +
+      `Inspect/restore ${OFFSET_FILE} (a .corrupt-*.bak backup was written next to it if possible), then start the bridge again.`
+    );
   }
+  if (persisted.state === 'valid') {
+    logInfo(`resuming from persisted Telegram offset ${persisted.offset}`);
+    return persisted.offset;
+  }
+  // state === 'missing': genuine first-ever start.
   // Read at call time (not import time) so tests can exercise both branches.
   if (/^(1|true|yes)$/i.test(process.env.PROCESS_INITIAL_BACKLOG || '')) {
     logInfo('PROCESS_INITIAL_BACKLOG=true: will process any messages sent while offline');
+    advanceOffset(-1, -1, osImpl); // persist initialization marker (offset 0); throws on failure
     return 0;
   }
   let latest = null;
@@ -590,10 +634,14 @@ async function purgeBacklogIfFirstStart({ osImpl = offsetStore, tgImpl = tg } = 
     const updates = await tgImpl.request('getUpdates', { offset: -1, timeout: 0, allowed_updates: ['message'] });
     if (Array.isArray(updates) && updates.length > 0) {
       latest = updates[updates.length - 1].update_id;
-      logInfo(`first start: skipping ${latest + 1} backlog update(s) sent while offline (set PROCESS_INITIAL_BACKLOG=true to change)`);
+      logInfo(`first start: skipping ${updates.length} pending Telegram update(s) sent while offline (set PROCESS_INITIAL_BACKLOG=true to change)`);
       advanceOffset(-1, latest, osImpl);
+    } else {
+      logInfo('first start: no pending Telegram updates; recording initialization state');
+      advanceOffset(-1, -1, osImpl); // persist marker 0 so a restart is NOT another first start
     }
   } catch (err) {
+    if (err && /^Failed to persist Telegram offset/.test(err.message)) throw err; // durability failure is fatal
     // Telegram unreachable: nothing to purge yet; normal polling will retry.
     logWarn('backlog probe skipped:', err.message);
   }
@@ -610,7 +658,10 @@ async function pollLoop(startOffset) {
         allowed_updates: ['message'],
       });
       for (const upd of updates || []) {
-        offset = advanceOffset(offset, upd.update_id); // persisted BEFORE handling
+        // advanceOffset persists BEFORE handling and throws when persistence
+        // fails: the update is not executed and `offset` stays put, so the
+        // next poll re-delivers the same update (at-most-once preserved).
+        offset = advanceOffset(offset, upd.update_id);
         try {
           if (upd.message) await handleMessage(upd.message);
         } catch (err) {
@@ -620,7 +671,10 @@ async function pollLoop(startOffset) {
     } catch (err) {
       if (shuttingDown) break;
       tg.markFailure();
-      logWarn('poll error:', err.message, '— retrying in 10s');
+      const backoff = /^Failed to persist Telegram offset/.test(err.message)
+        ? 'offset persistence failed — update NOT executed; retrying in 10s'
+        : 'retrying in 10s';
+      logWarn('poll error:', err.message, '—', backoff);
       await sleep(10_000);
     }
   }

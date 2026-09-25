@@ -20,7 +20,7 @@ process.env.ALLOWED_TELEGRAM_IDS = '111,222'; // test users
 process.env.CLAUDE_BIN = ''; // bare 'claude' (never actually spawned)
 
 const {
-  validateSessionName, parseAllowlist, intEnv, validateProxyUrl, resolveClaudeBin,
+  validateSessionName, parseAllowlist, intEnv, validateProxyUrl, resolveClaudeBin, resolveClaudeLaunch,
 } = require('../lib/config');
 const { parseCommand, BOT_COMMANDS, helpText } = require('../lib/commands');
 const { safeProxyLabel, parseWindowsProxyServer, envProxyUrl, resolveProxy } = require('../lib/proxy');
@@ -107,10 +107,17 @@ function lastSends(n = 1) {
     assert.strictEqual(validateProxyUrl('ftp://x:1').ok, false);
   });
 
-  await test('CLAUDE_BIN resolution: bare name ok, missing absolute path fails (issue 21)', () => {
+  await test('CLAUDE_BIN launch resolution: bare name resolves, missing absolute path fails (issue 21)', () => {
+    // On this machine a real `claude` exists on PATH; the empty form resolves too.
     assert.strictEqual(resolveClaudeBin('claude').ok, true);
     assert.strictEqual(resolveClaudeBin('').ok, true);
     assert.strictEqual(resolveClaudeBin('C:\\definitely\\not\\here\\claude.exe').ok, false);
+    // A bare name that matches nothing must FAIL (item 7).
+    const missing = resolveClaudeLaunch('definitely-not-installed-xyz', {
+      env: { PATH: process.platform === 'win32' ? 'C:\\does\\not\\exist' : '/does/not/exist' },
+    });
+    assert.strictEqual(missing.ok, false);
+    assert.ok(/not found on PATH/i.test(missing.error), missing.error);
   });
 
   // ---------------------------- commands -----------------------------------

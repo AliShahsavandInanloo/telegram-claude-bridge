@@ -52,9 +52,11 @@ Message lifecycle:
    otherwise the message is ignored (fail closed).
 3. **Queue** — the exact message text becomes a job (global FIFO across chats,
    at most `MAX_QUEUE_PER_CHAT` waiting jobs per chat, one `claude` process at a time).
-4. **Execute** — `spawn('claude', ['-p', <your text>, '--output-format', 'text',
-   '--dangerously-skip-permissions', ('--resume'|'--session-id'), <uuid>])` —
-   the prompt is passed as a spawn argument, never through a shell.
+4. **Execute** — `spawn(launch.command, [...launch.prefixArgs, '-p', <your text>,
+   '--output-format', 'text', '--dangerously-skip-permissions',
+   ('--resume'|'--session-id'), <uuid>], { shell: false })` — the prompt is
+   passed as a spawn argument, never through a shell. See §10b for how
+   `launch.command`/`prefixArgs` are derived from `CLAUDE_BIN`.
 5. **Report** — the result is sent back, chunked at 3,800 characters, with a
    plain-text fallback if Markdown fails. stdout/stderr capture is bounded
    (`MAX_STDOUT_BYTES` / `MAX_STDERR_BYTES`) with explicit truncation markers.
@@ -307,19 +309,59 @@ access to this machine. To revoke access, remove the ID from `.env` and restart.
 
 ## 10b. Message delivery semantics
 
-Telegram updates are processed **at-most-once**. The bridge persists the next
-update offset **before** executing the update: this prevents a command from
-being executed twice after a crash, but a crash between persisting and
-handling can cause that update to be skipped. For a bridge that runs Claude
-with broad machine permissions, never re-executing an old command is the
-safer trade.
+Telegram updates are processed **at-most-once**. The bridge durably persists
+the next update offset **before** executing the update: this prevents a
+command from being executed twice after a crash, but a crash between
+persisting and handling can cause that update to be skipped. For a bridge
+that runs Claude with broad machine permissions, never re-executing an old
+command is the safer trade.
+
+**If offset persistence fails, the command is not executed.** The update is
+not handled, the in-memory offset does not advance, and the poll loop retries
+— so the same update is delivered again once persistence recovers. Success
+is never reported without a durable save (temp file + fsync + rename).
+
+**Offset state categories** — the offset file can be in one of four states,
+and they are deliberately not interchangeable:
+
+| State | Meaning | Behavior |
+|---|---|---|
+| `missing` | never persisted (true first start) | first-start backlog policy runs |
+| `valid` | a saved offset exists | resume normally; never purge |
+| `corrupt` | file exists, content invalid | backup `.corrupt-*.bak` + **refuse to start** (never treated as first start — that would purge pending commands) |
+| `unreadable` | file exists, cannot be read | **refuse to start** with an actionable error |
 
 **First-start backlog policy** (`PROCESS_INITIAL_BACKLOG`, default `false`):
-on the very first start (no saved offset yet) the bridge skips all messages
-sent while it was offline, instead of executing potentially hours-old
-commands. With `PROCESS_INITIAL_BACKLOG=true` the backlog is consumed
-normally. On every later restart the bridge resumes from the saved offset —
-nothing is purged and nothing is re-executed.
+on the very first start the bridge skips all messages sent while it was
+offline, instead of executing potentially hours-old commands. With
+`PROCESS_INITIAL_BACKLOG=true` the backlog is consumed normally.
+**First successful initialization records state even when the backlog is
+empty** (offset `0` is persisted as the marker), so a restart after an empty
+first start is a normal resume — not another purge. On every later restart
+the bridge resumes from the saved offset — nothing is purged and nothing is
+re-executed.
+
+### Windows Claude resolution (`CLAUDE_BIN`)
+
+The bridge represents Claude execution as a **launch specification**
+(`{ command, prefixArgs }`) and always spawns
+`spawn(command, [...prefixArgs, ...args], { shell: false })` — the Telegram
+prompt is a direct argv element, never shell-interpolated. `shell:true` and
+`cmd.exe`/`powershell` are never used. Accepted `CLAUDE_BIN` values:
+
+- **empty or bare name** (`claude`) — resolved via PATH; the resolved file
+  must actually exist or startup fails (`… was not found on PATH`).
+- **native executable** (`claude.exe` or any directly spawnable file) —
+  `{ command: <that file>, prefixArgs: [] }`.
+- **Windows `.cmd`/`.bat` launcher** (npm-style shim) — parsed as a *known
+  launcher structure only*: `node  <path>\cli.js  %*` becomes
+  `{ command: node.exe, prefixArgs: [<cli.js>] }`; a shim invoking a sibling
+  `.exe` becomes that exe. Anything unparseable fails startup with
+  `Unable to safely resolve Claude from the Windows .cmd launcher…` —
+  the bridge never guesses (a wrong guess once produced `node.exe` with the
+  entrypoint dropped, i.e. plain node instead of Claude).
+- **JavaScript CLI entrypoint** (explicit path to `cli.js`) — launched via
+  the current Node runtime: `{ command: node, prefixArgs: [cli.js] }`.
 
 ---
 
@@ -330,7 +372,7 @@ nothing is purged and nothing is re-executed.
 | `TELEGRAM_BOT_TOKEN` | yes | — | from @BotFather (fallback: `TELEGRAM_CLAUDE_BOT_TOKEN`) |
 | `ALLOWED_TELEGRAM_IDS` | **yes** | — | comma-separated numeric user IDs; missing/empty/malformed = startup error |
 | `TELEGRAM_PROXY_URL` | no | auto | explicit proxy for Telegram traffic (loopback hosts allowed) |
-| `CLAUDE_BIN` | no | `claude` | claude executable if not on PATH; a Windows npm `.cmd` shim is resolved to the underlying `claude.exe`, otherwise startup fails with instructions |
+| `CLAUDE_BIN` | no | `claude` | Claude launch target: bare PATH name (must resolve), native executable, Windows `.cmd`/`.bat` launcher (parsed as node+cli.js or sibling-exe only), or explicit JS entrypoint (launched via node). Unparseable/missing targets fail startup — never a shell fallback |
 | `BRIDGE_CWD` | no | bridge folder | working directory for Claude jobs (must exist **and be a directory**) |
 | `BRIDGE_STATE_DIR` | no | `./state` | directory for `sessions.json` / `offset.txt` (created if missing); read from `.env` too |
 | `PROCESS_INITIAL_BACKLOG` | no | `false` | `false` (safe default): on the very first start, messages sent while offline are skipped, never executed. `true`: consume them. Restarts always resume from the saved offset. |
@@ -353,19 +395,21 @@ at startup.
 npm test
 ```
 
-52 sandboxed tests (no framework, no network, no spawned claude) verify:
-fail-closed auth and config validation; prompt text reaching Claude's args;
-`--session-id` vs `--resume` semantics; queued jobs keeping their session
-identity; group-suffix command parsing; command-menu consistency; proxy label
-redaction; Windows semicolon proxy parsing; loopback proxy acceptance;
-double-completion guard; bounded capture; global FIFO queue fairness;
-queue-close lifecycle; first-start backlog skipping; at-most-once offset
-ordering; sessions named `active`/`list` surviving restarts (schema v2);
-Windows `.cmd` shim detection; `.env` loading precedence; `BRIDGE_CWD`
-directory validation; persistence-failure propagation with `/new` rollback;
-and `/status` path privacy.
-atomic session persistence + corruption recovery; and that the bot token
-never leaks into outgoing messages.
+78 sandboxed tests (30 + 48; no framework, no network, no spawned claude)
+verify: fail-closed auth and config validation; prompt text reaching Claude's
+args with `shell:false` and correct launch-spec prefix order (a unit seam
+inspects command/args/options without spawning); `--session-id` vs `--resume`
+semantics; at-most-once offset ordering incl. **failed persistence blocking
+execution** and the in-memory offset not advancing; offset state categories
+(missing/valid/corrupt/unreadable) with corrupt state refusing first-start
+purge; empty-backlog initialization persisting its marker; Windows launch
+forms (native exe, npm `.cmd`/`.bat` → node+cli.js, JS entrypoint, malformed
+shims, missing bare executables); queue-close lifecycle; sessions named
+`active`/`list`/`sessions`/`activeSession`/`version` surviving structure-based
+migration (schema v2); `/new`-overwrite rollback restoring the OLD session on
+save failure; temp-file cleanup; `.env` loading precedence; `BRIDGE_CWD`
+directory validation; backlog logs reporting the update count (not an update
+id); and `/status` path privacy.
 
 `npm run check` runs a syntax check on `bridge.js`.
 
