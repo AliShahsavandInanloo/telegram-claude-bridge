@@ -112,11 +112,16 @@ The hub binds a **stable loopback port** (`CLAUDE_CHANNEL_PORT`, default
 no need to restart Claude Code. If the port is occupied the bridge refuses
 to start (never a silent random port). Liveness is enforced by a heartbeat
 (`CLAUDE_CHANNEL_HEARTBEAT_MS` / `…_TIMEOUT_MS`); zombie connections are
-dropped and cannot dispatch tools. Replies are **delivery-scoped**: Claude
-answers with the `delivery_id` from the channel tag, so a reply still lands
+dropped and cannot dispatch tools. Clients reconnect with bounded
+exponential backoff (2 s → 15 s max, reset on reconnect). Replies are
+delivery-scoped: Claude answers with the `delivery_id` from the channel
+tag (the legacy `chat_id` tool argument is deprecated and only works while
+the session is the chat's current attachment), so a reply still lands
 in the right chat even after you `/switch` sessions. File tools accept
 project-relative nested paths; anything resolving outside the project root
-(symlink/junction/`..`/UNC escapes) is rejected.
+(symlink/junction/`..`/UNC escapes) is rejected — including a symlinked
+`incoming/` upload directory, which cannot redirect writes outside the
+project.
 
 Commands also work group-style: `/status@YourBot` is accepted, and commands
 addressed to a different bot are ignored.

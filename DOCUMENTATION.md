@@ -524,8 +524,11 @@ sessions instead of falling back silently.
 occupied at startup the bridge **refuses to start** rather than silently
 picking a random port — already-running channel clients would otherwise
 reconnect to a dead endpoint forever. Channel clients reconnect with bounded
-backoff (2 s doubling to 15 s max), so a Bridge restart does NOT require
-restarting Claude Code.
+exponential backoff (2 s → 4 s → 8 s → 15 s max, reset after a healthy
+authenticated session), so a Bridge restart does NOT require
+restarting Claude Code. The production channel server uses the SAME shared
+framed client (`lib/channel/ipc.js`) as the hub — one authoritative
+implementation for framing, frame caps, ping/pong and reconnect.
 
 **Heartbeat / liveness:** the hub pings authenticated connections every
 `CLAUDE_CHANNEL_HEARTBEAT_MS` (default 5000; 1000–60000). Any valid traffic
@@ -547,6 +550,11 @@ share one resolver (`lib/claude/files.js`): `realpath(requested)` must be
 inside `realpath(projectRoot)` — symlink/junction escapes, `..` traversal,
 absolute and UNC paths outside the root are all rejected; safe nested paths
 (e.g. `reports/result.md`) ARE supported; directories are not sendable.
+Telegram uploads use the same model for the WRITE destination: because the
+uploaded file does not exist yet, the resolver validates the parent
+directory — `realpath(<project>/incoming)` must be inside
+`realpath(projectRoot)` — so a symlinked/junctioned `incoming` pointing
+outside the project is refused instead of silently writing outside.
 
 **Channel wire protocol (framed JSON, one object per line):**
 

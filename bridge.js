@@ -43,7 +43,7 @@ const { createProgressReporter } = require('./lib/claude/output');
 const { discoverClaudeProcesses } = require('./lib/claude/discover');
 const { createChannelHub } = require('./lib/channel/hub');
 const { createIpcServer, validateHeartbeatConfig } = require('./lib/channel/ipc');
-const { resolveProjectFile } = require('./lib/claude/files');
+const { resolveProjectFile, resolveUploadDest } = require('./lib/claude/files');
 const { spawn: spawnRaw } = require('child_process');
 const {
   parseAllowlist,
@@ -215,7 +215,18 @@ const claudeManager = createClaudeManager({
 });
 
 // Channel hub: authenticated localhost IPC for Channel-enabled Claude sessions.
-const channelHub = createChannelHub({ reg: registry, secret: CHANNEL_SECRET, logInfo, logWarn });
+// The STABLE port is part of the hub's construction config (fix: it previously
+// lived only in listen() opts while the server was built with port 0, so the
+// configured value never reached the socket and reconnect-after-restart broke).
+const channelHub = createChannelHub({
+  reg: registry,
+  secret: CHANNEL_SECRET,
+  port: CHANNEL_PORT,
+  heartbeatIntervalMs: hbCheck.intervalMs,
+  heartbeatTimeoutMs: hbCheck.timeoutMs,
+  logInfo,
+  logWarn,
+});
 
 // ---------------------------------------------------------------------------
 // Delivery-scoped reply authorization (fix 4)
@@ -673,17 +684,22 @@ async function handleFileUpload(chatId, document, { userId = '', messageId = nul
       if (size > TELEGRAM_FILE_MAX_BYTES) throw new Error('download exceeded size cap');
       chunks.push(c);
     }
+    // SAFE WRITE DESTINATION (fix 5): realpath(<project>/incoming) must be
+    // inside realpath(<project>) — a symlink/junction incoming dir pointing
+    // outside the project is refused instead of silently writing outside.
     const incomingDir = path.join(entry.project, 'incoming');
+    const destCheck = resolveUploadDest(entry.project, incomingDir, fileName);
+    if (!destCheck.ok) throw new Error(destCheck.error);
     fs.mkdirSync(incomingDir, { recursive: true });
-    const dest = path.join(incomingDir, fileName);
+    const dest = destCheck.path;
     fs.writeFileSync(dest, Buffer.concat(chunks));
-    await reply(chatId, `📎 Saved to ${projectLabel(entry.project)}/incoming/${fileName}. Notifying the session…`);
+    await reply(chatId, `📎 Saved to ${projectLabel(entry.project)}/${destCheck.relativePath}. Notifying the session…`);
     // Channel sessions get a channel event with safe metadata (no file
     // contents inlined); stream-json sessions get a task prompt.
     if (entry.transport === 'channel' && channelHub.isOnline(entry.id)) {
-      deliverToSession(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`, { file_path: `incoming/${fileName}` }, { userId, messageId });
+      deliverToSession(chatId, entry, `User uploaded file: ${destCheck.relativePath}. Analyze this file.`, { file_path: destCheck.relativePath }, { userId, messageId });
     } else {
-      routeToManaged(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`, { userId, messageId });
+      routeToManaged(chatId, entry, `User uploaded file: ${destCheck.relativePath}. Analyze this file.`, { userId, messageId });
     }
   } catch (err) {
     logError(`file upload failed chat=${chatId}: ${err.message}`);
@@ -1375,7 +1391,7 @@ if (require.main === module) (async () => {
   channelHub.listen(({ port }) => {
     hubPort = port;
     logInfo(`channel hub ready on 127.0.0.1:${port} (secret: state/channel-secret)`);
-  }, { port: CHANNEL_PORT, heartbeatIntervalMs: hbCheck.intervalMs, heartbeatTimeoutMs: hbCheck.timeoutMs, onFatal: (err) => failStartup(err.message) });
+  }, { onFatal: (err) => failStartup(err.message) });
   logInfo(`allowlist: ${ALLOWED.size} authorized user(s); backlog on first start: ${PROCESS_INITIAL_BACKLOG ? 'process' : 'skip'}`);
 
   let me = null;
