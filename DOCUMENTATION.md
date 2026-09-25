@@ -519,6 +519,51 @@ registers. Disconnects mark the session offline; attachments persist but are
 inactive until reconnect. `/attach` and `/switch` refuse offline Channel
 sessions instead of falling back silently.
 
+**Stable endpoint & reconnect:** the hub binds a STABLE configured port
+(`CLAUDE_CHANNEL_PORT`, default `8765`, loopback only). If that port is
+occupied at startup the bridge **refuses to start** rather than silently
+picking a random port — already-running channel clients would otherwise
+reconnect to a dead endpoint forever. Channel clients reconnect with bounded
+backoff (2 s doubling to 15 s max), so a Bridge restart does NOT require
+restarting Claude Code.
+
+**Heartbeat / liveness:** the hub pings authenticated connections every
+`CLAUDE_CHANNEL_HEARTBEAT_MS` (default 5000; 1000–60000). Any valid traffic
+refreshes liveness; a connection silent for `CLAUDE_CHANNEL_HEARTBEAT_TIMEOUT_MS`
+(default 15000; 2000–300000, must exceed the interval) is destroyed and the
+session goes offline. Zombie sockets can never dispatch tools.
+
+**Delivery-scoped replies (delayed reply after /switch):** every Telegram
+message routed to a Channel session creates a delivery record and passes
+`delivery_id` in the `<channel>` meta. The `reply`/`send_file` tools resolve
+that id to the ORIGINAL chat, so NDS can finish answering after you've
+`/switch`ed to OmniRoute. Rules: only the session that owns the delivery may
+use it; unknown/expired (6 h TTL) deliveries are rejected; no channel can
+name an arbitrary chat. The legacy `reply(chat_id, …)` form still works only
+while the session is the chat's CURRENT attachment and is deprecated.
+
+**Safe file paths:** `/download`, the channel `send_file` tool, and uploads
+share one resolver (`lib/claude/files.js`): `realpath(requested)` must be
+inside `realpath(projectRoot)` — symlink/junction escapes, `..` traversal,
+absolute and UNC paths outside the root are all rejected; safe nested paths
+(e.g. `reports/result.md`) ARE supported; directories are not sendable.
+
+**Channel wire protocol (framed JSON, one object per line):**
+
+| Frame | Direction | Purpose |
+|---|---|---|
+| `hello` | client → hub | auth: `{secret, clientId, protocol}` |
+| `hello_ok` | hub → client | authenticated |
+| `ping` / `pong` | both | heartbeat liveness |
+| `register` / `register_ack` / `register_nak` | client ↔ hub | session registration |
+| `deliver` | hub → client | Telegram message → channel event |
+| `channel_message` | client → hub | informational event from the session |
+| `tool_call` / `tool_result` | client ↔ hub | reply / send_file dispatch |
+
+Malformed, oversized (> 512 KiB) or non-loopback frames/connections are
+dropped; everything is authenticated with the per-install secret from
+`state/channel-secret` (never the bot token or any API credential).
+
 ### Legacy stream-json managed sessions
 
 `/new <name> <project-path>` (without a running channel) spawns a headless

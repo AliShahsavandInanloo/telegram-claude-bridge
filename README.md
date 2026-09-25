@@ -107,6 +107,17 @@ validates the session→chat mapping, applies the allowlist/chunking/size caps,
 and sends with the single Telegram client. The channel secret lives in
 `state/channel-secret` (0600) and is never the bot token or any API credential.
 
+The hub binds a **stable loopback port** (`CLAUDE_CHANNEL_PORT`, default
+8765) so live sessions **reconnect automatically after a bridge restart** —
+no need to restart Claude Code. If the port is occupied the bridge refuses
+to start (never a silent random port). Liveness is enforced by a heartbeat
+(`CLAUDE_CHANNEL_HEARTBEAT_MS` / `…_TIMEOUT_MS`); zombie connections are
+dropped and cannot dispatch tools. Replies are **delivery-scoped**: Claude
+answers with the `delivery_id` from the channel tag, so a reply still lands
+in the right chat even after you `/switch` sessions. File tools accept
+project-relative nested paths; anything resolving outside the project root
+(symlink/junction/`..`/UNC escapes) is rejected.
+
 Commands also work group-style: `/status@YourBot` is accepted, and commands
 addressed to a different bot are ignored.
 
@@ -146,7 +157,7 @@ Later restarts resume from the saved offset.
 npm test
 ```
 
-105 sandboxed tests (30 + 59 + 16) cover auth, prompt passing, session lifecycle,
+141 sandboxed tests (30 + 59 + 16 + 17 + 19) cover auth, prompt passing, session lifecycle,
 queue fairness and close semantics, proxy parsing/redaction, atomic
 persistence, first-start backlog skipping (empty and non-empty), at-most-once
 offset ordering incl. persistence-failure blocking, offset state categories

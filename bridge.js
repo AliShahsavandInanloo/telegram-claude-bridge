@@ -42,7 +42,8 @@ const { createClaudeManager } = require('./lib/claude/manager');
 const { createProgressReporter } = require('./lib/claude/output');
 const { discoverClaudeProcesses } = require('./lib/claude/discover');
 const { createChannelHub } = require('./lib/channel/hub');
-const { createIpcServer } = require('./lib/channel/ipc');
+const { createIpcServer, validateHeartbeatConfig } = require('./lib/channel/ipc');
+const { resolveProjectFile } = require('./lib/claude/files');
 const { spawn: spawnRaw } = require('child_process');
 const {
   parseAllowlist,
@@ -163,6 +164,24 @@ function loadOrCreateChannelSecret() {
 const CHANNEL_SECRET = loadOrCreateChannelSecret();
 let hubPort = 0; // set when the channel hub starts listening
 
+// Stable Channel endpoint (fix 1): the hub MUST bind the same port across
+// Bridge restarts, or already-running channel clients reconnect to a dead
+// endpoint forever. Default 8765; configurable; ephemeral (0) is refused.
+const chanPortCheck = intEnv(process.env.CLAUDE_CHANNEL_PORT, { name: 'CLAUDE_CHANNEL_PORT', def: 8765, min: 1024, max: 65535 });
+if (!chanPortCheck.ok) failStartup(chanPortCheck.error);
+const CHANNEL_PORT = chanPortCheck.value;
+
+function parseOptionalInt(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return undefined;
+  const n = parseInt(String(raw).trim(), 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+const hbCheck = validateHeartbeatConfig(
+  parseOptionalInt(process.env.CLAUDE_CHANNEL_HEARTBEAT_MS),
+  parseOptionalInt(process.env.CLAUDE_CHANNEL_HEARTBEAT_TIMEOUT_MS),
+);
+if (!hbCheck.ok) failStartup(hbCheck.error);
+
 const dirCheck = ensureWritableDir(STATE_DIR);
 if (!dirCheck.ok) failStartup(dirCheck.error);
 
@@ -198,17 +217,65 @@ const claudeManager = createClaudeManager({
 // Channel hub: authenticated localhost IPC for Channel-enabled Claude sessions.
 const channelHub = createChannelHub({ reg: registry, secret: CHANNEL_SECRET, logInfo, logWarn });
 
+// ---------------------------------------------------------------------------
+// Delivery-scoped reply authorization (fix 4)
+//
+// Every Telegram message routed to a Channel session creates a delivery
+// record. The reply tool resolves delivery_id -> {chatId, sessionId}; the
+// session that OWNS the delivery may reply to the ORIGINAL chat even if the
+// user has since /switch'ed to another session. Legacy reply(chat_id, text)
+// remains only for the CURRENT attachment (deprecated, documented).
+// ---------------------------------------------------------------------------
+
+const DELIVERY_TTL_MS = 6 * 60 * 60 * 1000; // 6 h — long analyses must stay replyable
+const deliveries = new Map(); // deliveryId -> { chatId, sessionId, createdAt, status }
+
+function createDelivery(chatId, sessionId) {
+  const id = require('crypto').randomBytes(8).toString('hex');
+  deliveries.set(id, { chatId: String(chatId), sessionId: String(sessionId), createdAt: Date.now(), status: 'open' });
+  // Bound the map: drop expired entries opportunistically.
+  if (deliveries.size > 1000) {
+    for (const [k, v] of deliveries) {
+      if (Date.now() - v.createdAt > DELIVERY_TTL_MS) deliveries.delete(k);
+    }
+  }
+  return id;
+}
+
+function resolveDelivery(deliveryId, { forSessionId = null } = {}) {
+  const d = deliveries.get(String(deliveryId || ''));
+  if (!d) return { ok: false, error: 'unknown delivery' };
+  if (d.status !== 'open') return { ok: false, error: `delivery ${d.status}` };
+  if (Date.now() - d.createdAt > DELIVERY_TTL_MS) {
+    d.status = 'expired';
+    return { ok: false, error: 'delivery expired' };
+  }
+  if (forSessionId && d.sessionId !== String(forSessionId)) {
+    return { ok: false, error: 'delivery belongs to another session' }; // cross-session theft
+  }
+  return { ok: true, delivery: d, error: null };
+}
+
 /**
  * Deliver a Telegram message to a Channel session as a channel event (the
- * message appears natively in the live Claude Code conversation), falling
- * back to the legacy stream-json task path for stream-json sessions.
+ * message appears natively in the live Claude Code conversation).
+ * Creates a delivery record and passes delivery_id in the channel meta so
+ * replies stay authorized even after /switch (fix 4).
  */
-function deliverToSession(chatId, entry, text, extraMeta = {}) {
+function deliverToSession(chatId, entry, text, extraMeta = {}, { userId = '', messageId = null } = {}) {
   registry.touch(entry.id);
   if (entry.transport === 'channel' && channelHub.isOnline(entry.id)) {
+    const deliveryId = createDelivery(chatId, entry.id);
     return channelHub.deliver(entry.id, {
       content: text,
-      meta: { chat_id: String(chatId), from: 'telegram', user_id: String(msgUserId || ''), ...extraMeta },
+      meta: {
+        chat_id: String(chatId),
+        delivery_id: deliveryId,
+        from: 'telegram',
+        user_id: String(userId || ''),
+        ...(messageId ? { message_id: String(messageId) } : {}),
+        ...extraMeta,
+      },
     });
   }
   return { ok: false, error: 'session_offline' };
@@ -463,8 +530,8 @@ function statusText(chatId) {
 // ---------------------------------------------------------------------------
 // Managed-session helpers (routing, formatting, files)
 // ---------------------------------------------------------------------------
-
-let msgUserId = ''; // sender id of the message currently being handled
+// (fix 5: msgUserId global removed — Telegram user identity is passed
+// explicitly through handleMessage -> routing/commands/file-upload params)
 
 /** Privacy: project paths are shown basename-only over Telegram. */
 function projectLabel(projectPath) {
@@ -526,13 +593,13 @@ function formatSessionStatus(st) {
  * Legacy stream-json sessions: the original submitTask path with streaming
  * progress and a hard task timeout.
  */
-function routeToManaged(chatId, entry, text) {
+function routeToManaged(chatId, entry, text, { userId = '', messageId = null } = {}) {
   if (entry.transport === 'channel') {
     if (!channelHub.isOnline(entry.id)) {
       reply(chatId, `⚠️ *${entry.name}* is a Channel session but is currently offline.\nStart Claude Code in that project with the channel enabled (see DOCUMENTATION.md §Channel), then it will reconnect automatically.`).catch(() => {});
       return;
     }
-    const r = deliverToSession(chatId, entry, text);
+    const r = deliverToSession(chatId, entry, text, {}, { userId, messageId });
     if (!r.ok) {
       reply(chatId, `❌ Could not deliver to *${entry.name}* (${r.error}).`).catch(() => {});
     }
@@ -577,7 +644,7 @@ function routeToManaged(chatId, entry, text) {
 // --------------------------- file exchange ---------------------------------
 
 /** Download a Telegram file into <project>/incoming/ (best effort, capped). */
-async function handleFileUpload(chatId, document) {
+async function handleFileUpload(chatId, document, { userId = '', messageId = null } = {}) {
   const entry = registry.attached(chatId);
   if (!entry) {
     await reply(chatId, 'Attach to a session first (/attach <name|number>) to upload files.');
@@ -614,9 +681,9 @@ async function handleFileUpload(chatId, document) {
     // Channel sessions get a channel event with safe metadata (no file
     // contents inlined); stream-json sessions get a task prompt.
     if (entry.transport === 'channel' && channelHub.isOnline(entry.id)) {
-      deliverToSession(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`, { file_path: `incoming/${fileName}` });
+      deliverToSession(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`, { file_path: `incoming/${fileName}` }, { userId, messageId });
     } else {
-      routeToManaged(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`);
+      routeToManaged(chatId, entry, `User uploaded file: incoming/${fileName}. Analyze this file.`, { userId, messageId });
     }
   } catch (err) {
     logError(`file upload failed chat=${chatId}: ${err.message}`);
@@ -639,33 +706,30 @@ function listProjectFiles(entry) {
   }
 }
 
-/** Send one project file back to Telegram (path-traversal safe). */
+/**
+ * Send one project file back to Telegram. Path safety is centralized in
+ * resolveProjectFile: realpath(requested) must be inside realpath(project)
+ * — symlink/junction escapes, traversal, absolute/UNC outside-root all
+ * rejected. Nested project-relative paths are supported.
+ */
 async function sendProjectFile(chatId, nameArg) {
   const entry = registry.attached(chatId);
   if (!entry) {
     await reply(chatId, 'No Claude session selected. Use /attach <name|number>.');
     return;
   }
-  const wanted = path.basename(String(nameArg || '').trim());
-  if (!wanted || wanted !== String(nameArg).trim()) {
-    await reply(chatId, '❌ Invalid file name (paths not allowed — see /files).');
+  const resolved = resolveProjectFile(entry.project, nameArg);
+  if (!resolved.ok) {
+    await reply(chatId, `❌ ${resolved.error}`);
     return;
   }
-  const full = path.join(entry.project, wanted);
   try {
-    let st;
-    try {
-      st = fs.statSync(full);
-    } catch {
-      throw new Error(`file "${wanted}" not found (see /files)`);
-    }
-    if (!st.isFile()) {
-      throw new Error(`"${wanted}" is not a file`);
-    }
+    const st = fs.statSync(resolved.path);
     if (st.size > TELEGRAM_FILE_MAX_BYTES) {
       throw new Error(`file too large (max ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024 / 1024)} MB)`);
     }
-    await sendDocumentMultipart(chatId, full, wanted);
+    const displayName = path.basename(resolved.path);
+    await sendDocumentMultipart(chatId, resolved.path, displayName);
   } catch (err) {
     await reply(chatId, `❌ ${err.message}`);
   }
@@ -737,11 +801,9 @@ async function handleMessage(msg) {
 
   // Documents: route to the attached managed session's project folder.
   if (Array.isArray(msg.document) || (msg.document && typeof msg.document === 'object')) {
-    await handleFileUpload(chatId, msg.document);
+    await handleFileUpload(chatId, msg.document, { userId, messageId: msg.message_id });
     return;
   }
-
-  msgUserId = userId; // used by /new to stamp session ownership
 
   if (typeof msg.text !== 'string' || !msg.text.trim()) {
     logDebug(`chat=${chatId}: ignoring non-text message type`);
@@ -757,16 +819,16 @@ async function handleMessage(msg) {
       logDebug(`ignoring command addressed to @${parsed.addressedTo}`);
       return;
     }
-    await dispatchCommand(chatId, parsed);
+    await dispatchCommand(chatId, parsed, { userId, messageId: msg.message_id });
     return;
   }
 
   // Plain text => task. Routing: if this chat is attached to a MANAGED
   // session, the text goes there (interactive managed Claude); otherwise the
-  // legacy one-shot queue behavior applies.
+  // legacy one-shot queue behavior applies. Sender identity is explicit.
   const attached = registry.attached(chatId);
   if (attached) {
-    routeToManaged(chatId, attached, text);
+    routeToManaged(chatId, attached, text, { userId, messageId: msg.message_id });
     return;
   }
 
@@ -798,7 +860,7 @@ async function handleMessage(msg) {
   if (!res.ok) logWarn(`enqueue rejected chat=${chatId} (${res.error})`);
 }
 
-async function dispatchCommand(chatId, parsed) {
+async function dispatchCommand(chatId, parsed, { userId = '', messageId = null } = {}) {
   const { cmd, arg } = parsed;
   switch (cmd) {
     case 'start':
@@ -815,7 +877,7 @@ async function dispatchCommand(chatId, parsed) {
       const name = isManaged ? parts.slice(0, -1).join(' ') : arg;
 
       if (isManaged) {
-        const created = claudeManager.createSession({ name, project: maybePath, owner: { userId: String(msgUserId || '') } });
+        const created = claudeManager.createSession({ name, project: maybePath, owner: { userId: String(userId || '') } });
         if (!created.ok) {
           await reply(chatId, `❌ ${created.error}`);
           return;
@@ -1261,38 +1323,59 @@ if (require.main === module) (async () => {
   });
   channelHub.onChannelTool(async (entry, tool, args) => {
     if (tool === 'reply') {
+      // PREFERRED: delivery-scoped reply. The channel passes the delivery_id
+      // from the <channel> tag meta; the Bridge resolves it to the original
+      // chat. This stays valid even after the user /switch'ed away.
+      if (args.delivery_id) {
+        const r = resolveDelivery(args.delivery_id, { forSessionId: entry.id });
+        if (!r.ok) throw new Error(r.error);
+        await reply(r.delivery.chatId, String(args.text || ''));
+        return { sent: true, delivery: true };
+      }
+      // DEPRECATED legacy form: reply(chat_id, text) — allowed ONLY while the
+      // session is the chat's current attachment. Documented for removal.
       const chatId = String(args.chat_id || '');
       if (!chatId || !/^-?\d+$/.test(chatId)) throw new Error('invalid chat_id');
-      // Validate the mapping: the session must be attached to this chat.
       const attached = registry.attached(chatId);
       if (!attached || attached.id !== entry.id) {
-        throw new Error('session is not attached to that chat');
+        throw new Error('session is not attached to that chat (use delivery_id from the channel tag)');
       }
       await reply(chatId, String(args.text || '')); // existing chunking/error handling
-      return { sent: true };
+      return { sent: true, delivery: false };
     }
     if (tool === 'send_file') {
-      const chatId = String(args.chat_id || '');
-      if (!chatId || !/^\d+$/.test(chatId)) throw new Error('invalid chat_id');
-      const attached = registry.attached(chatId);
-      if (!attached || attached.id !== entry.id) {
-        throw new Error('session is not attached to that chat');
+      // Resolve chat: delivery-scoped preferred, current-attachment fallback.
+      let chatId = null;
+      if (args.delivery_id) {
+        const r = resolveDelivery(args.delivery_id, { forSessionId: entry.id });
+        if (!r.ok) throw new Error(r.error);
+        chatId = r.delivery.chatId;
+      } else {
+        const cand = String(args.chat_id || '');
+        if (!cand || !/^-?\d+$/.test(cand)) throw new Error('invalid chat_id');
+        const attached = registry.attached(cand);
+        if (!attached || attached.id !== entry.id) {
+          throw new Error('session is not attached to that chat (use delivery_id from the channel tag)');
+        }
+        chatId = cand;
       }
-      // Reuse /download path-safety logic (basename-only, size cap).
-      const wanted = path.basename(String(args.file_path || '').trim());
-      const full = path.join(entry.project, wanted);
-      const st = fs.statSync(full);
-      if (!st.isFile()) throw new Error('not a file');
-      if (st.size > TELEGRAM_FILE_MAX_BYTES) throw new Error(`file too large (max ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024 / 1024)} MB)`);
-      await sendDocumentMultipart(chatId, full, wanted);
-      return { sent: true, file: wanted };
+      // Centralized path safety: realpath inside realpath(project) — symlink/
+      // junction/UNC/absolute escapes all rejected; nested paths supported.
+      const resolved = resolveProjectFile(entry.project, args.file_path);
+      if (!resolved.ok) throw new Error(resolved.error);
+      const st = fs.statSync(resolved.path);
+      if (st.size > TELEGRAM_FILE_MAX_BYTES) {
+        throw new Error(`file too large (max ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024 / 1024)} MB)`);
+      }
+      await sendDocumentMultipart(chatId, resolved.path, path.basename(resolved.path));
+      return { sent: true, file: resolved.relativePath };
     }
     throw new Error(`unknown tool: ${tool}`);
   });
   channelHub.listen(({ port }) => {
     hubPort = port;
     logInfo(`channel hub ready on 127.0.0.1:${port} (secret: state/channel-secret)`);
-  });
+  }, { port: CHANNEL_PORT, heartbeatIntervalMs: hbCheck.intervalMs, heartbeatTimeoutMs: hbCheck.timeoutMs, onFatal: (err) => failStartup(err.message) });
   logInfo(`allowlist: ${ALLOWED.size} authorized user(s); backlog on first start: ${PROCESS_INITIAL_BACKLOG ? 'process' : 'skip'}`);
 
   let me = null;

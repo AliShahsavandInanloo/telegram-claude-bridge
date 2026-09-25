@@ -1125,7 +1125,7 @@ function memOffsetStore(initialCommits = [], loadState = missingState) {
         await T.handleMessage({ chat: { id: 930005 }, from: { id: 111 }, text: `/download ${evil}` });
         const replies = tgStub.calls.filter((c) => c.method === 'sendMessage').map((c) => c.params.text);
         const last = replies[replies.length - 1] || '';
-        assert.ok(/Invalid|not a file|does not|not found/i.test(last) || last === '', `rejected: ${evil}`);
+        assert.ok(/Invalid|not a file|does not|not found|traversal|outside|not allowed/i.test(last) || last === '', `rejected: ${evil}`);
         assert.ok(!tgStub.calls.slice(before).some((c) => c.method === 'sendDocument'), 'no document sent for invalid request');
       }
     } finally {
