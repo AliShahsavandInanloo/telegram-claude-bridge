@@ -109,7 +109,9 @@ and sends with the single Telegram client. The channel secret lives in
 
 The hub binds a **stable loopback port** (`CLAUDE_CHANNEL_PORT`, default
 8765) so live sessions **reconnect automatically after a bridge restart** —
-no need to restart Claude Code. If the port is occupied the bridge refuses
+no need to restart Claude Code; the full registration handshake (through
+`register_ack`) runs again on every reconnect, and the session re-binds to
+the same registry record. If the port is occupied the bridge refuses
 to start (never a silent random port). Liveness is enforced by a heartbeat
 (`CLAUDE_CHANNEL_HEARTBEAT_MS` / `…_TIMEOUT_MS`); zombie connections are
 dropped and cannot dispatch tools. Clients reconnect with bounded
@@ -117,7 +119,9 @@ exponential backoff (2 s → 15 s max, reset on reconnect). Replies are
 delivery-scoped: Claude answers with the `delivery_id` from the channel
 tag (the legacy `chat_id` tool argument is deprecated and only works while
 the session is the chat's current attachment), so a reply still lands
-in the right chat even after you `/switch` sessions. File tools accept
+in the right chat even after you `/switch` sessions — and delivery records
+are persisted, so a task that outlives a Bridge restart can still reply.
+File tools accept
 project-relative nested paths; anything resolving outside the project root
 (symlink/junction/`..`/UNC escapes) is rejected — including a symlinked
 `incoming/` upload directory, which cannot redirect writes outside the

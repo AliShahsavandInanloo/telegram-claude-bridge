@@ -76,7 +76,18 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
   if (connectedSpy) connectedSpy.push(conn);
   hub.onConnection({ conn, hello: { clientId, secret: SECRET } });
   conn.fire({ type: 'register', registration: { project, projectName, channelName: 'telegram-bridge', claudeSessionId, pid: 1234, protocol: 1 } });
-  return conn;
+  // Registration persistence is now async (transactional save with fsync);
+  // wait until the ack/nak actually arrives before assertions run.
+  return new Promise((resolve) => {
+    const started = Date.now();
+    (function poll() {
+      if (conn.sent.some((m) => m.type === 'register_ack' || m.type === 'register_nak') || Date.now() - started > 2000) {
+        resolve(conn);
+        return;
+      }
+      setTimeout(poll, 5);
+    })();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -128,13 +139,13 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
 
   // ---------------- Channel registration & identity --------------------------
 
-  await test('hub: valid registration creates a channel registry entry', () => {
+  await test('hub: valid registration creates a channel registry entry', async () => {
     const dir = tmpDir();
     const proj = path.join(dir, 'proj');
     fs.mkdirSync(proj);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    const conn = registerConn(hub, reg, { clientId: 'c-1', project: proj, projectName: 'NDS', claudeSessionId: '0e5b3a2e-1d2f-4c6b-9a3f-0000000000a1' });
+    const conn = await registerConn(hub, reg, { clientId: 'c-1', project: proj, projectName: 'NDS', claudeSessionId: '0e5b3a2e-1d2f-4c6b-9a3f-0000000000a1' });
     const ack = conn.sent.find((m) => m.type === 'register_ack');
     assert.ok(ack, 'register_ack sent');
     const entry = reg.getByName('nds');
@@ -156,19 +167,19 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     assert.ok(conn.sent.some((m) => m.type === 'register_nak'), 'register_nak sent');
   });
 
-  await test('hub: reconnect with same clientId rebinds (no duplicate records)', () => {
+  await test('hub: reconnect with same clientId rebinds (no duplicate records)', async () => {
     const dir = tmpDir();
     const proj = path.join(dir, 'proj');
     fs.mkdirSync(proj);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    const c1 = registerConn(hub, reg, { clientId: 'same', project: proj, projectName: 'NDS' });
+    const c1 = await registerConn(hub, reg, { clientId: 'same', project: proj, projectName: 'NDS' });
     const entry1 = reg.getByName('nds');
     // simulate disconnect
     c1.destroy(); // fires the hub's close listener
     assert.strictEqual(reg.getByName('nds').connected, false, 'offline after disconnect');
     // reconnect with the SAME clientId
-    const c2 = registerConn(hub, reg, { clientId: 'same', project: proj, projectName: 'NDS' });
+    const c2 = await registerConn(hub, reg, { clientId: 'same', project: proj, projectName: 'NDS' });
     const entry2 = reg.getByName('nds');
     assert.strictEqual(entry2.id, entry1.id, 'same registry entry reused');
     assert.strictEqual(entry2.connected, true);
@@ -176,13 +187,13 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     assert.ok(hub.isOnline(entry2.id));
   });
 
-  await test('hub: disconnect marks offline, attachment survives but inactive', () => {
+  await test('hub: disconnect marks offline, attachment survives but inactive', async () => {
     const dir = tmpDir();
     const proj = path.join(dir, 'proj');
     fs.mkdirSync(proj);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    const conn = registerConn(hub, reg, { clientId: 'c-9', project: proj, projectName: 'NDS' });
+    const conn = await registerConn(hub, reg, { clientId: 'c-9', project: proj, projectName: 'NDS' });
     const entry = reg.getByName('nds');
     reg.attach('555', entry.id);
     conn.destroy(); // fires the hub's close listener
@@ -209,7 +220,7 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
 
   // ---------------- Routing isolation ----------------------------------------
 
-  await test('routing: message goes ONLY to the selected session', () => {
+  await test('routing: message goes ONLY to the selected session', async () => {
     const dir = tmpDir();
     const pA = path.join(dir, 'a');
     const pB = path.join(dir, 'b');
@@ -217,8 +228,8 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     fs.mkdirSync(pB);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    const cNds = registerConn(hub, reg, { clientId: 'nds', project: pA, projectName: 'NDS' });
-    const cOmni = registerConn(hub, reg, { clientId: 'omni', project: pB, projectName: 'OmniRoute' });
+    const cNds = await registerConn(hub, reg, { clientId: 'nds', project: pA, projectName: 'NDS' });
+    const cOmni = await registerConn(hub, reg, { clientId: 'omni', project: pB, projectName: 'OmniRoute' });
     const nds = reg.getByName('nds');
     const omni = reg.getByName('omniroute');
     reg.attach('111', nds.id); // chat A -> NDS
@@ -233,7 +244,7 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     assert.strictEqual(deliveredNds.meta.chat_id, '111', 'chat_id rides in meta');
   });
 
-  await test('routing: /switch changes the destination session', () => {
+  await test('routing: /switch changes the destination session', async () => {
     const dir = tmpDir();
     const pA = path.join(dir, 'a');
     const pB = path.join(dir, 'b');
@@ -241,8 +252,8 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     fs.mkdirSync(pB);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    const cNds = registerConn(hub, reg, { clientId: 'nds', project: pA, projectName: 'NDS' });
-    const cOmni = registerConn(hub, reg, { clientId: 'omni', project: pB, projectName: 'OmniRoute' });
+    const cNds = await registerConn(hub, reg, { clientId: 'nds', project: pA, projectName: 'NDS' });
+    const cOmni = await registerConn(hub, reg, { clientId: 'omni', project: pB, projectName: 'OmniRoute' });
     const nds = reg.getByName('nds');
     const omni = reg.getByName('omniroute');
     reg.attach('111', nds.id);

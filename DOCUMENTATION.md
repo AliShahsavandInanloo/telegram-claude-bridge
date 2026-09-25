@@ -544,15 +544,35 @@ that id to the ORIGINAL chat, so NDS can finish answering after you've
 use it; unknown/expired (6 h TTL) deliveries are rejected; no channel can
 name an arbitrary chat. The legacy `reply(chat_id, …)` form still works only
 while the session is the chat's CURRENT attachment and is deprecated.
+Deliveries are PERSISTED in `state/deliveries.json` (atomic writes, bounded
+to 1000 records, expired records purged on load and insert; only routing
+metadata is stored — never message text), so a `delivery_id` still resolves
+after a Bridge restart — a finished long-running task can still reply.
+
+**Registration & lifecycle:** registration happens on EVERY authenticated
+reconnect (TCP connect → hello → hello_ok → register → register_ack), not
+just the first connection. The hub persists the registry record
+transactionally (snapshot → mutate → save) BEFORE sending `register_ack`; a
+failed save rolls back and the connection gets `register_nak` — authenticated
+but never treated as registered/online. Client state is explicit:
+`socketConnected` / `authenticated` / `registered` — the channel is usable
+only after `register_ack`, and any disconnect drops it back to
+unregistered until a new handshake completes. A hub shutdown marks all
+sessions offline first, so reconnects re-bind to the SAME registry record
+(no duplicates). `npm run check` syntax-checks every project JS file via
+`scripts/check.js` (glob-discovered — bridge.js, lib/**, test/**, scripts/**);
+`npm test` runs all seven suites (see package.json).
 
 **Safe file paths:** `/download`, the channel `send_file` tool, and uploads
 share one resolver (`lib/claude/files.js`): `realpath(requested)` must be
 inside `realpath(projectRoot)` — symlink/junction escapes, `..` traversal,
 absolute and UNC paths outside the root are all rejected; safe nested paths
 (e.g. `reports/result.md`) ARE supported; directories are not sendable.
-Telegram uploads use the same model for the WRITE destination: because the
-uploaded file does not exist yet, the resolver validates the parent
-directory — `realpath(<project>/incoming)` must be inside
+Telegram uploads use the same model for the WRITE destination: the first
+upload to a fresh project creates `<project>/incoming` (the created
+directory is re-verified to resolve inside the project), and a symlinked/
+junctioned `incoming` pointing outside the project is refused — never
+overwritten or written through.
 `realpath(projectRoot)` — so a symlinked/junctioned `incoming` pointing
 outside the project is refused instead of silently writing outside.
 

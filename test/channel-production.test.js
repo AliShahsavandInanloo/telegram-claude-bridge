@@ -113,6 +113,17 @@ function makeRegistry() {
     attach: (chatId, id) => attached.set(String(chatId), String(id)),
     attached: (chatId) => entries.get(attached.get(String(chatId))) || null,
     detach: (chatId) => attached.delete(String(chatId)),
+    save: async () => true, // transactional registration awaits a real save
+    snapshot: () => ({
+      entries: new Map([...entries].map(([k, v]) => [k, { ...v }])),
+      attachments: new Map(attached),
+    }),
+    restore: (snap) => {
+      entries.clear();
+      for (const [k, v] of snap.entries) entries.set(k, { ...v });
+      attached.clear();
+      for (const [k, v] of snap.attachments) attached.set(k, v);
+    },
   };
 }
 

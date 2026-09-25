@@ -42,8 +42,9 @@ const { createClaudeManager } = require('./lib/claude/manager');
 const { createProgressReporter } = require('./lib/claude/output');
 const { discoverClaudeProcesses } = require('./lib/claude/discover');
 const { createChannelHub } = require('./lib/channel/hub');
+const { createDeliveryStore } = require('./lib/channel/deliveries');
 const { createIpcServer, validateHeartbeatConfig } = require('./lib/channel/ipc');
-const { resolveProjectFile, resolveUploadDest } = require('./lib/claude/files');
+const { resolveProjectFile, resolveUploadDest, ensureUploadDir } = require('./lib/claude/files');
 const { spawn: spawnRaw } = require('child_process');
 const {
   parseAllowlist,
@@ -161,7 +162,10 @@ function loadOrCreateChannelSecret() {
   }
   return secret;
 }
-const CHANNEL_SECRET = loadOrCreateChannelSecret();
+// STARTUP ORDER (fix 4): the secret is LOADED only AFTER ensureWritableDir
+// below has created/validated STATE_DIR. The old order created channel-secret
+// before the state dir existed, so a fresh clone failed at secret creation.
+let CHANNEL_SECRET = null; // assigned right after the dir check
 let hubPort = 0; // set when the channel hub starts listening
 
 // Stable Channel endpoint (fix 1): the hub MUST bind the same port across
@@ -184,6 +188,8 @@ if (!hbCheck.ok) failStartup(hbCheck.error);
 
 const dirCheck = ensureWritableDir(STATE_DIR);
 if (!dirCheck.ok) failStartup(dirCheck.error);
+// State dir is writable — now (and only now) load or create the hub secret.
+CHANNEL_SECRET = loadOrCreateChannelSecret();
 
 const claudeCheck = resolveClaudeLaunch(process.env.CLAUDE_BIN || 'claude');
 if (!claudeCheck.ok) failStartup(claudeCheck.error);
@@ -226,45 +232,42 @@ const channelHub = createChannelHub({
   heartbeatTimeoutMs: hbCheck.timeoutMs,
   logInfo,
   logWarn,
+  logError,
 });
 
 // ---------------------------------------------------------------------------
-// Delivery-scoped reply authorization (fix 4)
+// Delivery-scoped reply authorization
 //
 // Every Telegram message routed to a Channel session creates a delivery
 // record. The reply tool resolves delivery_id -> {chatId, sessionId}; the
 // session that OWNS the delivery may reply to the ORIGINAL chat even if the
 // user has since /switch'ed to another session. Legacy reply(chat_id, text)
 // remains only for the CURRENT attachment (deprecated, documented).
+//
+// The store is PERSISTED (state/deliveries.json, atomic writes, TTL purge,
+// bounded size) so a delivery_id still resolves after a Bridge restart —
+// the main long-running-session use case (fix 5). Only routing metadata is
+// persisted; never the message text.
 // ---------------------------------------------------------------------------
 
-const DELIVERY_TTL_MS = 6 * 60 * 60 * 1000; // 6 h — long analyses must stay replyable
-const deliveries = new Map(); // deliveryId -> { chatId, sessionId, createdAt, status }
+const DELIVERIES_FILE = path.join(STATE_DIR, 'deliveries.json');
+const deliveryStore = createDeliveryStore(DELIVERIES_FILE, { ttlMs: 6 * 60 * 60 * 1000, maxEntries: 1000 });
+deliveryStore.load(); // purge expired records from any previous run
 
-function createDelivery(chatId, sessionId) {
-  const id = require('crypto').randomBytes(8).toString('hex');
-  deliveries.set(id, { chatId: String(chatId), sessionId: String(sessionId), createdAt: Date.now(), status: 'open' });
-  // Bound the map: drop expired entries opportunistically.
-  if (deliveries.size > 1000) {
-    for (const [k, v] of deliveries) {
-      if (Date.now() - v.createdAt > DELIVERY_TTL_MS) deliveries.delete(k);
-    }
+function createDelivery(chatId, sessionId, telegramMessageId = null) {
+  const id = deliveryStore.create({ chatId, sessionId, telegramMessageId });
+  try {
+    deliveryStore.save();
+  } catch (err) {
+    // The delivery already exists in memory; persistence failure only loses
+    // post-restart replyability for THIS message, never routes it elsewhere.
+    logError(`delivery persist failed (in-memory only): ${err.message}`);
   }
   return id;
 }
 
 function resolveDelivery(deliveryId, { forSessionId = null } = {}) {
-  const d = deliveries.get(String(deliveryId || ''));
-  if (!d) return { ok: false, error: 'unknown delivery' };
-  if (d.status !== 'open') return { ok: false, error: `delivery ${d.status}` };
-  if (Date.now() - d.createdAt > DELIVERY_TTL_MS) {
-    d.status = 'expired';
-    return { ok: false, error: 'delivery expired' };
-  }
-  if (forSessionId && d.sessionId !== String(forSessionId)) {
-    return { ok: false, error: 'delivery belongs to another session' }; // cross-session theft
-  }
-  return { ok: true, delivery: d, error: null };
+  return deliveryStore.resolve(deliveryId, { forSessionId });
 }
 
 /**
@@ -684,13 +687,17 @@ async function handleFileUpload(chatId, document, { userId = '', messageId = nul
       if (size > TELEGRAM_FILE_MAX_BYTES) throw new Error('download exceeded size cap');
       chunks.push(c);
     }
-    // SAFE WRITE DESTINATION (fix 5): realpath(<project>/incoming) must be
-    // inside realpath(<project>) — a symlink/junction incoming dir pointing
-    // outside the project is refused instead of silently writing outside.
+    // SAFE WRITE DESTINATION: (1) create <project>/incoming if missing —
+    // validating the REAL result stays inside the project (a symlink/junction
+    // incoming pointing outside is refused, never written through); this used
+    // to run resolve-before-mkdir, so the FIRST upload to a fresh project
+    // failed with "upload directory does not exist". (2) resolve the final
+    // destination against the canonical directory.
     const incomingDir = path.join(entry.project, 'incoming');
-    const destCheck = resolveUploadDest(entry.project, incomingDir, fileName);
+    const dirCheck = ensureUploadDir(entry.project, incomingDir);
+    if (!dirCheck.ok) throw new Error(dirCheck.error);
+    const destCheck = resolveUploadDest(entry.project, dirCheck.dir, fileName);
     if (!destCheck.ok) throw new Error(destCheck.error);
-    fs.mkdirSync(incomingDir, { recursive: true });
     const dest = destCheck.path;
     fs.writeFileSync(dest, Buffer.concat(chunks));
     await reply(chatId, `📎 Saved to ${projectLabel(entry.project)}/${destCheck.relativePath}. Notifying the session…`);
