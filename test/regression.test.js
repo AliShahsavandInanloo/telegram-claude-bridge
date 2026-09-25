@@ -138,6 +138,66 @@ function memOffsetStore(initialCommits = [], loadState = missingState) {
     assert.ok(/update NOT handled/.test(threw.message), threw.message);
   });
 
+  await test('processUpdates: commit succeeds → update executes and offset advances', async () => {
+    const handled = [];
+    const os = memOffsetStore();
+    const offset = await T.processUpdates(
+      [{ update_id: 7, message: { chat: { id: 1 }, from: { id: 111 }, text: 'task-a' } },
+       { update_id: 9, message: { chat: { id: 1 }, from: { id: 111 }, text: 'task-b' } }],
+      { osImpl: os, handle: async (m) => handled.push(m.text) },
+    );
+    assert.deepStrictEqual(handled, ['task-a', 'task-b'], 'both updates executed after durable persist');
+    assert.deepStrictEqual(os.committed, [8, 10], 'offsets persisted BEFORE handling');
+    assert.strictEqual(offset, 10);
+  });
+
+  await test('processUpdates: commit fails → update does NOT execute, offset unchanged, error visible', async () => {
+    const handled = [];
+    const errors = [];
+    const origError = console.error;
+    console.error = (...a) => errors.push(a.join(' '));
+    const committed = [];
+    const os = { load: missingState, commit: () => false, committed };
+    let threw = null;
+    try {
+      await T.processUpdates(
+        [{ update_id: 7, message: { chat: { id: 1 }, from: { id: 111 }, text: 'task-a' } },
+         { update_id: 9, message: { chat: { id: 1 }, from: { id: 111 }, text: 'task-b' } }],
+        { osImpl: os, handle: async (m) => handled.push(m.text) },
+      );
+    } catch (err) {
+      threw = err;
+    } finally {
+      console.error = origError;
+    }
+    assert.ok(threw && /Failed to persist Telegram offset 8/.test(threw.message), 'persist failure surfaced');
+    assert.deepStrictEqual(handled, [], 'NO update executed without a durable offset');
+    assert.deepStrictEqual(committed, [], 'in-memory offset never advanced');
+    // Visibility: the thrown message matches the pattern pollLoop branches on
+    // to log its dedicated "offset persistence failed — update NOT executed"
+    // backoff warning before retrying.
+    assert.ok(/^Failed to persist Telegram offset/.test(threw.message), 'pollLoop logs a dedicated backoff for this');
+  });
+
+  await test('processUpdates: restart can safely receive the same update again after failure', async () => {
+    // Simulates: persist fails -> crash/restart -> same update redelivered ->
+    // persistence recovers -> update executes exactly once.
+    const handled = [];
+    let fail = true;
+    const os = { load: missingState, commit: () => (fail ? false : true), committed: [] };
+    try {
+      await T.processUpdates([{ update_id: 7, message: { chat: { id: 1 }, from: { id: 111 }, text: 'x' } }],
+        { osImpl: os, handle: async (m) => handled.push(m.text) });
+      assert.fail('must throw');
+    } catch { /* expected */ }
+    assert.deepStrictEqual(handled, []);
+    fail = false;
+    const offset = await T.processUpdates([{ update_id: 7, message: { chat: { id: 1 }, from: { id: 111 }, text: 'x' } }],
+      { osImpl: os, handle: async (m) => handled.push(m.text) });
+    assert.deepStrictEqual(handled, ['x'], 'redelivered update executed exactly once after recovery');
+    assert.strictEqual(offset, 8);
+  });
+
   // ---------------- Pass 3 items 3+4: first-start init & offset states ------
 
   await test('first start with EMPTY backlog persists initialization state (offset 0)', async () => {
@@ -872,6 +932,79 @@ function memOffsetStore(initialCommits = [], loadState = missingState) {
     const created = store.create('5', 'work');
     store.markInitialized('5', created.session.id);
     assert.strictEqual(store.get('5', 'work').initialized, true);
+  });
+
+  await test('runClaudeJob: init-save failure surfaces as a report warning and rolls the flag back', async () => {
+    const realTg = T.getTelegram();
+    const tgStub = fakeTg();
+    T.setTelegram(tgStub);
+    const sessionId = '0e5b3a2e-1d2f-4c6b-9a3f-00000000cafe';
+    const child = (() => {
+      const handlers = {};
+      return {
+        on: (ev, fn) => { (handlers[ev] = handlers[ev] || []).push(fn); },
+        stdout: { on: () => {} },
+        stderr: { on: () => {} },
+        kill() {},
+        fire(ev, ...args) { for (const fn of handlers[ev] || []) fn(...args); },
+      };
+    })();
+    // Chat pre-seeded with an uninitialized session matching the job.
+    const st = T.store.chat('920001');
+    st.list.set('work', { id: sessionId, initialized: false });
+    st.active = 'work';
+    const origSave = T.store.save;
+    T.store.save = async () => { throw new Error('EACCES: disk full'); };
+    try {
+      const p = T.runClaudeJob('920001', {
+        chatId: '920001', sessionName: 'work', sessionId,
+        initialized: false, text: 'hello', cwd: process.cwd(),
+      }, { spawnFn: () => child });
+      await new Promise((r) => setTimeout(r, 15));
+      child.fire('close', 0, null);
+      await p;
+    } finally {
+      T.store.save = origSave;
+      T.setTelegram(realTg);
+    }
+    const replies = tgStub.calls.filter((c) => c.method === 'sendMessage').map((c) => c.params.text);
+    const report = replies.find((t) => /done in/.test(t));
+    assert.ok(report, 'job report sent');
+    assert.ok(/session state not saved to disk/.test(report), `warning shown: ${report}`);
+    // Flag rolled back so the next job re-creates with --session-id (never
+    // blindly resumes state that was never durably recorded).
+    assert.strictEqual(T.store.get('920001', 'work').initialized, false, 'initialized flag rolled back');
+  });
+
+  await test('runClaudeJob: successful init persists and marks the session resumable', async () => {
+    const realTg = T.getTelegram();
+    T.setTelegram(fakeTg());
+    const sessionId = '0e5b3a2e-1d2f-4c6b-9a3f-00000000bead';
+    const child = (() => {
+      const handlers = {};
+      return {
+        on: (ev, fn) => { (handlers[ev] = handlers[ev] || []).push(fn); },
+        stdout: { on: () => {} },
+        stderr: { on: () => {} },
+        kill() {},
+        fire(ev, ...args) { for (const fn of handlers[ev] || []) fn(...args); },
+      };
+    })();
+    const st = T.store.chat('920002');
+    st.list.set('work', { id: sessionId, initialized: false });
+    st.active = 'work';
+    try {
+      const p = T.runClaudeJob('920002', {
+        chatId: '920002', sessionName: 'work', sessionId,
+        initialized: false, text: 'hello', cwd: process.cwd(),
+      }, { spawnFn: () => child });
+      await new Promise((r) => setTimeout(r, 15));
+      child.fire('close', 0, null);
+      await p;
+    } finally {
+      T.setTelegram(realTg);
+    }
+    assert.strictEqual(T.store.get('920002', 'work').initialized, true, 'session marked resumable');
   });
 
   await test('no dead exports: safeSend / COMMAND_NAMES removed from lib', () => {

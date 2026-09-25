@@ -648,6 +648,26 @@ async function purgeBacklogIfFirstStart({ osImpl = offsetStore, tgImpl = tg } = 
   return latest === null ? 0 : latest + 1;
 }
 
+/**
+ * Process one batch of updates: persist each next offset BEFORE handling its
+ * update (at-most-once). If offset persistence fails, the update is NOT
+ * handled, the in-memory offset stays put, and the error propagates to the
+ * poll loop — which logs it clearly and retries, so Telegram re-delivers the
+ * same update. Injectable (`osImpl`, `handle`) for tests.
+ */
+async function processUpdates(updates, { osImpl = offsetStore, handle = handleMessage } = {}) {
+  let offset = null;
+  for (const upd of updates || []) {
+    offset = advanceOffset(offset === null ? -1 : offset, upd.update_id, osImpl);
+    try {
+      if (upd.message) await handle(upd.message);
+    } catch (err) {
+      logError('handler error:', err.message);
+    }
+  }
+  return offset;
+}
+
 async function pollLoop(startOffset) {
   let offset = startOffset;
   while (!shuttingDown) {
@@ -779,6 +799,7 @@ module.exports = {
     offsetStore,
     claudeRunner,
     advanceOffset,
+    processUpdates,
     purgeBacklogIfFirstStart,
     setStore(fake) {
       // Tests inject a store-backed stub (see test/bridge.test.js).
