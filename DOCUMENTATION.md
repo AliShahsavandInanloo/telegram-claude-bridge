@@ -551,17 +551,26 @@ after a Bridge restart — a finished long-running task can still reply.
 
 **Registration & lifecycle:** registration happens on EVERY authenticated
 reconnect (TCP connect → hello → hello_ok → register → register_ack), not
-just the first connection. The hub persists the registry record
-transactionally (snapshot → mutate → save) BEFORE sending `register_ack`; a
-failed save rolls back and the connection gets `register_nak` — authenticated
-but never treated as registered/online. Client state is explicit:
-`socketConnected` / `authenticated` / `registered` — the channel is usable
-only after `register_ack`, and any disconnect drops it back to
-unregistered until a new handshake completes. A hub shutdown marks all
-sessions offline first, so reconnects re-bind to the SAME registry record
-(no duplicates). `npm run check` syntax-checks every project JS file via
+just the first connection. Registration is a single TRANSACTION in the hub:
+pure target lookup → pre-mutation registry snapshot → staged mutation →
+persist → COMMIT (connection ownership + online map) → `register_ack`. A
+session becomes ROUTABLE (appears in `onlineIds`/`isOnline`, accepts
+deliveries and tool calls) only after the save commits — never before.
+Failure at any point rolls the registry back exactly (no ghost records, no
+metadata drift), leaves the online map untouched, and the connection gets
+`register_nak`. A duplicate/replacement registration behaves the same way:
+the old healthy connection is destroyed only AFTER the replacement persists;
+a failed replacement leaves the old connection authoritative. The client
+treats `register_nak` as a retry signal: it drops the connection and its
+bounded exponential backoff schedules a fresh attempt (backoff resets on a
+successful registration). Channel state machine: `disconnected →
+connecting → authenticated → registering → registered`; disconnect from any
+state returns to `disconnected`; only `registered` is usable
+(`link.isUsable()` / `.registered`). A hub shutdown marks all sessions
+offline first, so reconnects re-bind to the SAME registry record (no
+duplicates). `npm run check` syntax-checks every project JS file via
 `scripts/check.js` (glob-discovered — bridge.js, lib/**, test/**, scripts/**);
-`npm test` runs all seven suites (see package.json).
+`npm test` runs all eight suites (see package.json).
 
 **Safe file paths:** `/download`, the channel `send_file` tool, and uploads
 share one resolver (`lib/claude/files.js`): `realpath(requested)` must be

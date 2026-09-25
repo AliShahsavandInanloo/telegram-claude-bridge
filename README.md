@@ -111,7 +111,11 @@ The hub binds a **stable loopback port** (`CLAUDE_CHANNEL_PORT`, default
 8765) so live sessions **reconnect automatically after a bridge restart** —
 no need to restart Claude Code; the full registration handshake (through
 `register_ack`) runs again on every reconnect, and the session re-binds to
-the same registry record. If the port is occupied the bridge refuses
+the same registry record. Registration is atomic: a session becomes
+routable only after its registry record is durably persisted, a failed
+persist rolls everything back and the client retries with backoff, and a
+replacement connection never retires the old one until it is safely
+committed. If the port is occupied the bridge refuses
 to start (never a silent random port). Liveness is enforced by a heartbeat
 (`CLAUDE_CHANNEL_HEARTBEAT_MS` / `…_TIMEOUT_MS`); zombie connections are
 dropped and cannot dispatch tools. Clients reconnect with bounded

@@ -154,7 +154,7 @@ function wait(ms) {
     server.close();
   });
 
-  await test('registry: reconnect does not create a duplicate entry (covered pattern at hub level)', () => {
+  await test('registry: reconnect does not create a duplicate entry (covered pattern at hub level)', async () => {
     const dir = tmpDir();
     const reg = require('../lib/claude/registry').createRegistry(path.join(dir, 'r.json'));
     const { createChannelHub } = require('../lib/channel/hub');
@@ -164,10 +164,12 @@ function wait(ms) {
     const c1 = fakeConn();
     hub.onConnection({ conn: c1, hello: { clientId: 'same-id', secret: SECRET } });
     c1.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
+    await wait(60); // registration commit is now transactional/async
     c1.destroy();
     const c2 = fakeConn();
     hub.onConnection({ conn: c2, hello: { clientId: 'same-id', secret: SECRET } });
     c2.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
+    await wait(60);
     assert.strictEqual(reg.list().length, 1, 'reconnect rebinds, no duplicate record');
     assert.strictEqual(reg.getByName('nds').connected, true);
     hub.close();
@@ -217,7 +219,7 @@ function wait(ms) {
     server.close();
   });
 
-  await test('heartbeat: reconnect after zombie cleanup restores identity (hub level)', () => {
+  await test('heartbeat: reconnect after zombie cleanup restores identity (hub level)', async () => {
     const reg = require('../lib/claude/registry').createRegistry(path.join(tmpDir(), 'r.json'));
     const { createChannelHub } = require('../lib/channel/hub');
     const hub = createChannelHub({ reg, secret: SECRET, ipcsImpl: [1], logInfo: () => {}, logWarn: () => {} });
@@ -226,6 +228,7 @@ function wait(ms) {
     const c = fakeConn();
     hub.onConnection({ conn: c, hello: { clientId: 'hb-1', secret: SECRET } });
     c.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
+    await wait(60); // commit is transactional/async
     const entry = reg.getByName('nds');
     assert.ok(entry.connected);
     // zombie cleanup: hub drops the connection
@@ -235,12 +238,13 @@ function wait(ms) {
     const c2 = fakeConn();
     hub.onConnection({ conn: c2, hello: { clientId: 'hb-1', secret: SECRET } });
     c2.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
+    await wait(60);
     assert.strictEqual(reg.get(entry.id).connected, true, 'reconnected with same registry identity');
     assert.strictEqual(reg.list().length, 1);
     hub.close();
   });
 
-  await test('stale replaced connection cannot dispatch tools', () => {
+  await test('stale replaced connection cannot dispatch tools', async () => {
     const reg = require('../lib/claude/registry').createRegistry(path.join(tmpDir(), 'r.json'));
     const { createChannelHub } = require('../lib/channel/hub');
     const hub = createChannelHub({ reg, secret: SECRET, ipcsImpl: [1], logInfo: () => {}, logWarn: () => {} });
@@ -254,11 +258,13 @@ function wait(ms) {
     const old = fakeConn();
     hub.onConnection({ conn: old, hello: { clientId: 'dup', secret: SECRET } });
     old.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
+    await wait(60); // commit is transactional/async
     const entry = reg.getByName('nds');
     // replacement connection with the same clientId arrives:
     const fresh = fakeConn();
     hub.onConnection({ conn: fresh, hello: { clientId: 'dup', secret: SECRET } });
     fresh.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
+    await wait(60);
     assert.ok(old.destroyed, 'old connection destroyed on replacement');
     // old socket tries to dispatch a tool:
     old.fire({ type: 'tool_call', tool: 'reply', callId: 'x1', args: { delivery_id: 'nope', text: 'hi' } });
@@ -400,7 +406,7 @@ function wait(ms) {
     assert.ok(true); // covered by hub-level tests below
   });
 
-  await test('delivery: reply succeeds AFTER /switch; cross-session and unknown rejected', () => {
+  await test('delivery: reply succeeds AFTER /switch; cross-session and unknown rejected', async () => {
     const reg = require('../lib/claude/registry').createRegistry(path.join(tmpDir(), 'r.json'));
     const { createChannelHub } = require('../lib/channel/hub');
     const hub = createChannelHub({ reg, secret: SECRET, ipcsImpl: [1], logInfo: () => {}, logWarn: () => {} });
@@ -414,6 +420,7 @@ function wait(ms) {
     const cB = fakeConn();
     hub.onConnection({ conn: cB, hello: { clientId: 'omni', secret: SECRET } });
     cB.fire({ type: 'register', registration: { project: pB, projectName: 'OmniRoute' } });
+    await wait(80); // both registrations commit transactionally/async
     const nds = reg.getByName('nds');
     const omni = reg.getByName('omniroute');
 
@@ -452,34 +459,35 @@ function wait(ms) {
     cA.fire({ type: 'tool_call', tool: 'reply', callId: 'r1', args: { delivery_id: deliveryId, text: 'late answer' } });
 
     let cOmni = null;
-    return wait(20).then(() => {
-      assert.deepStrictEqual(sentToTelegram, [{ chatId: '111', by: 'NDS' }], 'A: delayed reply reaches the ORIGINAL chat');
-      // B: OmniRoute (its ORIGINAL online connection cB) tries to use NDS's delivery id:
-      if (!cOmni) cOmni = cB; // use the already-online OmniRoute connection
-      cOmni.fire({ type: 'tool_call', tool: 'reply', callId: 'r2', args: { delivery_id: deliveryId, text: 'theft' } });
-      return wait(20);
-    }).then(() => {
-      assert.strictEqual(sentToTelegram.length, 1, 'B: cross-session delivery use rejected');
-      const nak = cOmni.sent.find((m) => m.type === 'tool_result' && m.callId === 'r2');
-      assert.ok(nak && /another session/.test(nak.error || ''), `B error: ${nak && nak.error}`);
-      // C: unknown delivery id
-      cOmni.fire({ type: 'tool_call', tool: 'reply', callId: 'r3', args: { delivery_id: 'does-not-exist', text: 'x' } });
-      return wait(20);
-    }).then(() => {
-      const nak3 = cOmni.sent.find((m) => m.type === 'tool_result' && m.callId === 'r3');
-      assert.ok(nak3 && /unknown delivery/.test(nak3.error || ''), 'C: unknown delivery rejected');
-      // E: stale (destroyed) connection cannot even dispatch
-      const stale = fakeConn();
-      hub.onConnection({ conn: stale, hello: { clientId: 'nds', secret: SECRET } });
-      stale.fire({ type: 'register', registration: { project: pA, projectName: 'NDS' } });
-      const newer = fakeConn();
-      hub.onConnection({ conn: newer, hello: { clientId: 'nds', secret: SECRET } });
-      newer.fire({ type: 'register', registration: { project: pA, projectName: 'NDS' } });
-      assert.ok(stale.destroyed, 'stale replaced socket destroyed');
-      stale.fire({ type: 'tool_call', tool: 'reply', callId: 'r4', args: { delivery_id: deliveryId, text: 'zombie' } });
-      hub.close();
-      assert.ok(true, 'E: stale socket dispatch dropped (destroyed connections get no events)');
-    });
+    await wait(20);
+    assert.deepStrictEqual(sentToTelegram, [{ chatId: '111', by: 'NDS' }], 'A: delayed reply reaches the ORIGINAL chat');
+    // B: OmniRoute (its ORIGINAL online connection cB) tries to use NDS's delivery id:
+    if (!cOmni) cOmni = cB; // use the already-online OmniRoute connection
+    cOmni.fire({ type: 'tool_call', tool: 'reply', callId: 'r2', args: { delivery_id: deliveryId, text: 'theft' } });
+    await wait(20);
+    assert.strictEqual(sentToTelegram.length, 1, 'B: cross-session delivery use rejected');
+    const nak = cOmni.sent.find((m) => m.type === 'tool_result' && m.callId === 'r2');
+    assert.ok(nak && /another session/.test(nak.error || ''), `B error: ${nak && nak.error}`);
+    // C: unknown delivery id
+    cOmni.fire({ type: 'tool_call', tool: 'reply', callId: 'r3', args: { delivery_id: 'does-not-exist', text: 'x' } });
+    await wait(20);
+    const nak3 = cOmni.sent.find((m) => m.type === 'tool_result' && m.callId === 'r3');
+    assert.ok(nak3 && /unknown delivery/.test(nak3.error || ''), 'C: unknown delivery rejected');
+    // E: stale (destroyed) connection cannot even dispatch. Replacement is
+    // transactional: the old conn is retired only after the new one commits.
+    const stale = fakeConn();
+    hub.onConnection({ conn: stale, hello: { clientId: 'nds', secret: SECRET } });
+    stale.fire({ type: 'register', registration: { project: pA, projectName: 'NDS' } });
+    await wait(60);
+    const newer = fakeConn();
+    hub.onConnection({ conn: newer, hello: { clientId: 'nds', secret: SECRET } });
+    newer.fire({ type: 'register', registration: { project: pA, projectName: 'NDS' } });
+    await wait(60);
+    assert.ok(stale.destroyed, 'stale replaced socket destroyed');
+    stale.fire({ type: 'tool_call', tool: 'reply', callId: 'r4', args: { delivery_id: deliveryId, text: 'zombie' } });
+    await wait(20);
+    assert.strictEqual(sentToTelegram.length, 1, 'E: stale socket dispatch dropped (destroyed connections get no events)');
+    hub.close();
   });
 
   await test('delivery: expired delivery rejected', () => {

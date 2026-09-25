@@ -202,7 +202,7 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     assert.strictEqual(hub.deliver(entry.id, { content: 'x', meta: {} }).error, 'session_offline', 'delivery refused while offline');
   });
 
-  await test('hub: two projects = two independent online sessions', () => {
+  await test('hub: two projects = two independent online sessions', async () => {
     const dir = tmpDir();
     const pA = path.join(dir, 'a');
     const pB = path.join(dir, 'b');
@@ -210,8 +210,8 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     fs.mkdirSync(pB);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    registerConn(hub, reg, { clientId: 'nds-1', project: pA, projectName: 'NDS' });
-    registerConn(hub, reg, { clientId: 'omni-1', project: pB, projectName: 'OmniRoute' });
+    await registerConn(hub, reg, { clientId: 'nds-1', project: pA, projectName: 'NDS' });
+    await registerConn(hub, reg, { clientId: 'omni-1', project: pB, projectName: 'OmniRoute' });
     assert.strictEqual(reg.list().length, 2);
     const nds = reg.getByName('nds');
     const omni = reg.getByName('omniroute');
@@ -272,9 +272,12 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     fs.mkdirSync(proj);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    registerConn(hub, reg, { clientId: 'nds', project: proj, projectName: 'NDS' });
+    const first = await registerConn(hub, reg, { clientId: 'nds', project: proj, projectName: 'NDS' });
     const nds = reg.getByName('nds');
     const sentToTelegram = [];
+    // The tool path runs on the hub's message routing for the authoritative
+    // connection; use the registered one directly.
+    const conn = first;
     // Simulate the Bridge-side tool handler (same logic as bridge.js):
     hub.onChannelTool(async (entry, tool, args) => {
       if (tool === 'reply') {
@@ -287,9 +290,6 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     });
     reg.attach('999', nds.id);
     // invoke the tool path via the hub's message routing
-    const conn = fakeConn();
-    hub.onConnection({ conn, hello: { clientId: 'nds', secret: SECRET } });
-    conn.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
     conn.fire({ type: 'tool_call', tool: 'reply', callId: 't1', args: { chat_id: '999', text: 'hi from claude' } });
     await new Promise((r) => setTimeout(r, 20));
     assert.deepStrictEqual(sentToTelegram, [{ chatId: '999', text: 'hi from claude' }]);
@@ -303,7 +303,7 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     fs.mkdirSync(proj);
     const reg = createRegistry(path.join(dir, 'r.json'));
     const { hub } = makeHub(reg);
-    registerConn(hub, reg, { clientId: 'nds', project: proj, projectName: 'NDS' });
+    const conn = await registerConn(hub, reg, { clientId: 'nds', project: proj, projectName: 'NDS' });
     const nds = reg.getByName('nds');
     const sentToTelegram = [];
     hub.onChannelTool(async (entry, tool, args) => {
@@ -316,9 +316,6 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
       throw new Error(`unknown tool: ${tool}`);
     });
     reg.attach('777', nds.id);
-    const conn = fakeConn();
-    hub.onConnection({ conn, hello: { clientId: 'nds', secret: SECRET } });
-    conn.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
     conn.fire({ type: 'tool_call', tool: 'reply', callId: 't2', args: { chat_id: '31337', text: 'injection' } });
     await new Promise((r) => setTimeout(r, 20));
     assert.strictEqual(sentToTelegram.length, 0, 'unmapped chat never receives a message');
