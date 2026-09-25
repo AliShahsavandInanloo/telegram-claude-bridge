@@ -5,7 +5,7 @@
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",
-    "test": "node test/bridge.test.js && node test/regression.test.js && node test/claude-manager.test.js && node test/channel.test.js && node test/channel-stabilization.test.js && node test/channel-production.test.js && node test/channel-restart.test.js && node test/channel-registration-txn.test.js",
+    "test": "node test/bridge.test.js && node test/regression.test.js && node test/claude-manager.test.js && node test/channel.test.js && node test/channel-stabilization.test.js && node test/channel-production.test.js && node test/channel-restart.test.js && node test/channel-registration-txn.test.js && node test/channel-concurrency.test.js",
     "check": "node scripts/check.js"
   },
   "engines": {

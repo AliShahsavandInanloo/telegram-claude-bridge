@@ -551,26 +551,37 @@ after a Bridge restart — a finished long-running task can still reply.
 
 **Registration & lifecycle:** registration happens on EVERY authenticated
 reconnect (TCP connect → hello → hello_ok → register → register_ack), not
-just the first connection. Registration is a single TRANSACTION in the hub:
-pure target lookup → pre-mutation registry snapshot → staged mutation →
-persist → COMMIT (connection ownership + online map) → `register_ack`. A
-session becomes ROUTABLE (appears in `onlineIds`/`isOnline`, accepts
-deliveries and tool calls) only after the save commits — never before.
-Failure at any point rolls the registry back exactly (no ghost records, no
-metadata drift), leaves the online map untouched, and the connection gets
-`register_nak`. A duplicate/replacement registration behaves the same way:
-the old healthy connection is destroyed only AFTER the replacement persists;
-a failed replacement leaves the old connection authoritative. The client
+just the first connection. Registration is a single TRANSACTION in the hub,
+SERIALIZED per clientId through a per-identity mutex (different Channel
+sessions register concurrently): pure target lookup → pre-mutation registry
+snapshot → staged mutation → persist → COMMIT VALIDATION (candidate alive,
+generation still current) → commit (connection ownership + online map) →
+`register_ack`. A session becomes ROUTABLE (appears in `onlineIds`/
+`isOnline`, accepts deliveries and tool calls) only after the save commits —
+never before. Each registration attempt carries a monotonically increasing
+generation; only the current generation may commit, so a candidate that
+closed or was superseded while its save was pending can never become
+authoritative — it gets `register_nak` ("superseded" / "connection lost"),
+the registry is repaired, and any previously healthy connection stays
+authoritative. A duplicate/replacement registration retires the old healthy
+connection only AFTER the replacement persists and validates. The client
 treats `register_nak` as a retry signal: it drops the connection and its
 bounded exponential backoff schedules a fresh attempt (backoff resets on a
-successful registration). Channel state machine: `disconnected →
-connecting → authenticated → registering → registered`; disconnect from any
-state returns to `disconnected`; only `registered` is usable
-(`link.isUsable()` / `.registered`). A hub shutdown marks all sessions
-offline first, so reconnects re-bind to the SAME registry record (no
-duplicates). `npm run check` syntax-checks every project JS file via
-`scripts/check.js` (glob-discovered — bridge.js, lib/**, test/**, scripts/**);
-`npm test` runs all eight suites (see package.json).
+successful registration). Late close events from retired connections are
+ignored — only the authoritative connection's close takes the session
+offline. Channel identity is the persisted `clientId` on the registry
+record (primary reconnect key; name/project are metadata), so multiple
+Claude sessions on the same project keep distinct identities across Bridge
+restarts; legacy records without a clientId are backfilled on first
+registration. Channel state machine: `disconnected → connecting →
+authenticated → registering → registered`; disconnect from any state
+returns to `disconnected`; only `registered` is usable (`link.isUsable()` /
+`.registered`); `link.onClose(fn)` fires once per connection loss. A hub
+shutdown marks all sessions offline first, so reconnects re-bind to the
+SAME registry record (no duplicates). `npm run check` syntax-checks every
+project JS file via `scripts/check.js` (glob-discovered — bridge.js,
+lib/**, test/**, scripts/**); `npm test` runs all nine suites (see
+package.json).
 
 **Safe file paths:** `/download`, the channel `send_file` tool, and uploads
 share one resolver (`lib/claude/files.js`): `realpath(requested)` must be

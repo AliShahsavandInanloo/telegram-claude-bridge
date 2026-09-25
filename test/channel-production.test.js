@@ -110,6 +110,17 @@ function makeRegistry() {
       const e = entries.get(String(id));
       if (e) e.lastActivity = Date.now();
     },
+    getByClientId: (clientId) => {
+      const c = String(clientId || '');
+      if (!c) return null;
+      for (const e of entries.values()) if (e.clientId === c) return e;
+      return null;
+    },
+    setClientId: (id, clientId) => {
+      const e = entries.get(String(id));
+      if (e && typeof clientId === 'string' && clientId) e.clientId = clientId;
+      return !!e;
+    },
     attach: (chatId, id) => attached.set(String(chatId), String(id)),
     attached: (chatId) => entries.get(attached.get(String(chatId))) || null,
     detach: (chatId) => attached.delete(String(chatId)),
