@@ -709,13 +709,18 @@ project you ran it in), while the plain `claude` command is not modified at all.
 **Where the port and secret come from.** `scripts/launch-channel.js` is the
 registered MCP entry point. At runtime it:
 
-- loads the Bridge `.env` (`applyEnvFile`) and takes `CLAUDE_CHANNEL_PORT` from
-  it — the same single source of truth the Bridge itself uses (this install
-  resolves `8766`, not a hardcoded default);
+- reads **only** `CLAUDE_CHANNEL_PORT` — first from the real environment, then
+  from the Bridge `.env` via the non-mutating `readEnvValue` helper (the same
+  single source of truth the Bridge itself uses; this install resolves `8766`,
+  not a hardcoded default). It deliberately does **NOT** import the whole
+  Bridge `.env`: Bridge-only values such as `TELEGRAM_BOT_TOKEN`,
+  `ALLOWED_TELEGRAM_IDS`, or `TELEGRAM_PROXY_URL` never enter the Channel
+  process's environment (least privilege);
 - reads the hub secret **from disk**: `CLAUDE_CHANNEL_SECRET_FILE` if set, else
   `state/channel-secret`;
-- exports both into its own process and runs the Channel in-process (no
-  subprocess, no shell, no secret in any argv);
+- exports exactly two values into its own process — `CLAUDE_CHANNEL_PORT` and
+  `CLAUDE_CHANNEL_SECRET` — and runs the Channel in-process (no subprocess, no
+  shell, no secret in any argv);
 - prints nothing secret — `node scripts/launch-channel.js --selftest` reports
   `{port, secretSource, secretLength}` only.
 
@@ -733,9 +738,20 @@ npm run uninstall-global    # removes only what this installer created
 
 `install-global` refuses to overwrite a user-scope server named
 `telegram-bridge` that it did not create, and both commands leave unrelated MCP
-servers and project configuration alone. Uninstall deletes a wrapper only when
-it carries this installer's marker, and never touches `.env`, `state/`, or
-`node_modules/`.
+servers and project configuration alone. Ownership is decided by an **exact
+normalized launcher-path comparison** (`samePath`: absolute, slash-normalized,
+case-insensitive on Windows only): a foreign registration pointing to another
+project's `launch-channel.js` is *not* ours and is refused by install and
+uninstall alike (`--force` retains its documented override on uninstall).
+Uninstall deletes a wrapper only when it carries this installer's marker, and
+never touches `.env`, `state/`, or `node_modules/`.
+
+**Executable pinning.** The MCP registration and the Bridge wrapper use the
+**absolute Node executable** resolved at install time (e.g.
+`C:\Program Files\nodejs\node.exe`), so they keep working regardless of which
+PATH Claude Code or the invoking shell inherits. If replacing an existing own
+registration fails after the old entry was removed, the installer attempts to
+restore the previous registration and reports the rollback result.
 
 **Verifying from an unrelated directory** (no `.mcp.json` present):
 

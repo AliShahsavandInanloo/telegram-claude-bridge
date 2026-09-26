@@ -46,6 +46,33 @@ const WRAPPER_NAMES = [CLAUDE_TELEGRAM_CMD, BRIDGE_CMD];
 // ---------------------------------------------------------------------------
 
 /**
+ * Platform-aware path equality for ownership decisions.
+ *
+ *   - normalizes to absolute paths and forward/back slash direction
+ *   - Windows (win32): case-INSENSITIVE (NTFS default is case-insensitive)
+ *   - everything else: case-SENSITIVE (Unix filesystems are case-sensitive)
+ *
+ * An empty/relative-only argument never matches (ownership checks must be
+ * based on real absolute paths).
+ */
+function samePath(a, b, platform = process.platform) {
+  const sa = String(a || '').trim();
+  const sb = String(b || '').trim();
+  if (!sa || !sb) return false;
+  if (!path.isAbsolute(sa) || !path.isAbsolute(sb)) return false;
+  let na;
+  let nb;
+  try {
+    na = path.resolve(sa);
+    nb = path.resolve(sb);
+  } catch {
+    return false;
+  }
+  if (platform === 'win32') return na.toLowerCase() === nb.toLowerCase();
+  return na === nb;
+}
+
+/**
  * Directory that receives the wrapper commands. Defaults to `~/.local/bin`,
  * which is already on this user's PATH and needs no Administrator rights.
  * Overridable with --bin-dir or BRIDGE_BIN_DIR.
@@ -78,7 +105,7 @@ function renderCmd({ lines }) {
  * Neither file contains a secret: the Claude wrapper names the MCP server, and
  * the Bridge wrapper only starts the Bridge, which loads its own .env.
  */
-function wrapperContents({ root, claudeExe = 'claude' }) {
+function wrapperContents({ root, claudeExe = 'claude', nodeExe = 'node' }) {
   const claudeTelegram = renderCmd({
     lines: [
       'REM Launch Claude Code in the CURRENT directory with the telegram-bridge Channel.',
@@ -92,7 +119,9 @@ function wrapperContents({ root, claudeExe = 'claude' }) {
     lines: [
       'REM Start the central Telegram Bridge (the only Telegram Bot API consumer).',
       `cd /d "${root}"`,
-      'node bridge.js %*',
+      // PIN the Node executable resolved at install time: the wrapper must not
+      // depend on whichever PATH the invoking shell happens to have.
+      `"${nodeExe}" "${path.join(root, 'bridge.js')}" %*`,
     ],
   });
 
@@ -110,7 +139,10 @@ function isManaged(content) {
 
 /**
  * argv for `claude mcp add`. Uses USER scope so the server is visible from
- * every project; a project .mcp.json becomes unnecessary.
+ * every project; a project .mcp.json becomes unnecessary. `nodeExe` should be
+ * the ABSOLUTE node executable resolved by checkPrerequisites() — pinning it
+ * makes the registration independent of whatever PATH Claude Code inherits
+ * (PowerShell vs VS Code vs GUI launches). Paths only — never the secret.
  */
 function buildMcpAddArgs({ launcherPath, nodeExe = 'node', serverName = MCP_SERVER_NAME }) {
   return ['mcp', 'add', '-s', 'user', serverName, '--', nodeExe, launcherPath];
@@ -127,27 +159,25 @@ function buildMcpGetArgs({ serverName = MCP_SERVER_NAME } = {}) {
 }
 
 /**
- * A user-scope registration is "ours" when the command is node and the single
- * argument is this installation's launcher. Used to avoid clobbering an
- * unrelated server that happens to be called `telegram-bridge`.
+ * A user-scope registration is "ours" ONLY when the command is node and the
+ * launcher argument is THIS installation's launcher — compared as an exact
+ * normalized path (samePath: absolute, slash-normalized, case-insensitive on
+ * Windows only).
+ *
+ * An arbitrary existing file is NEVER accepted just because its basename is
+ * `launch-channel.js`: a foreign registration like
+ * `node C:\OtherProject\scripts\launch-channel.js` is NOT ours, and both the
+ * installer and uninstaller must refuse to touch it.
  */
 function isOwnRegistration(entry, { launcherPath, fsImpl = require('fs') } = {}) {
   if (!entry || typeof entry !== 'object') return false;
   if (String(entry.type || 'stdio') !== 'stdio') return false;
-  const command = path.basename(String(entry.command || ''));
+  const command = path.basename(String(entry.command || '')).toLowerCase();
   if (command !== 'node' && command !== 'node.exe') return false;
   const args = Array.isArray(entry.args) ? entry.args : [];
   const launcher = args.find((a) => typeof a === 'string' && a.toLowerCase().endsWith('.js'));
   if (!launcher) return false;
-  const norm = (p) => path.resolve(String(p)).toLowerCase();
-  if (path.resolve(launcher).toLowerCase() === norm(launcherPath)) return true;
-  // The launcher may have moved within the same install; accept any existing
-  // launch-channel.js under the same root as ours.
-  try {
-    return fsImpl.existsSync(launcher) && path.basename(launcher) === 'launch-channel.js';
-  } catch {
-    return false;
-  }
+  return samePath(launcher, launcherPath);
 }
 
 module.exports = {
@@ -164,4 +194,5 @@ module.exports = {
   buildMcpRemoveArgs,
   buildMcpGetArgs,
   isOwnRegistration,
+  samePath,
 };

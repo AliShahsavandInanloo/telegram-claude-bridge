@@ -140,7 +140,7 @@ function secretStatus() {
   }
 }
 
-function installMcp({ dryRun, home = os.homedir() }) {
+function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node' }) {
   const before = readUserMcpEntry(MCP_SERVER_NAME, home);
   if (before.present && !isOwnRegistration(before.entry, { launcherPath: LAUNCHER, fsImpl: fs })) {
     return {
@@ -150,17 +150,31 @@ function installMcp({ dryRun, home = os.homedir() }) {
     };
   }
 
-  const addArgs = buildMcpAddArgs({ launcherPath: LAUNCHER, nodeExe: 'node' });
+  // PIN the absolute Node executable resolved by checkPrerequisites(): the
+  // registered command must not depend on whatever PATH Claude Code inherits.
+  const addArgs = buildMcpAddArgs({ launcherPath: LAUNCHER, nodeExe: nodeExe || 'node' });
   if (dryRun) {
     return { action: before.present ? 'replace' : 'add', args: addArgs, dryRun: true };
   }
 
-  // Remove first so re-running never creates a duplicate entry.
-  if (before.present) runClaude(buildMcpRemoveArgs());
-  const added = runClaude(addArgs);
-  if (!added.ok) return { action: 'failed', error: added.stderr || added.stdout || 'claude mcp add failed' };
+  // Replacement is failure-safe: remember the previous OWN registration so a
+  // failed `claude mcp add` can roll it back instead of leaving NO registration.
+  const previous = before.present ? { command: before.entry.command, args: [...(before.entry.args || [])] } : null;
 
-  const verified = runClaude(buildMcpGetArgs());
+  // Remove first so re-running never creates a duplicate entry.
+  // (Called via module.exports so tests can stub the subprocess runner.)
+  if (before.present) module.exports.runClaude(buildMcpRemoveArgs());
+  const added = module.exports.runClaude(addArgs);
+  if (!added.ok) {
+    let rollback = null;
+    if (previous) {
+      const restore = module.exports.runClaude(['mcp', 'add', '-s', 'user', MCP_SERVER_NAME, '--', previous.command, ...previous.args]);
+      rollback = restore.ok ? 'previous registration restored' : `ROLLBACK FAILED: previous registration could not be restored (run: claude mcp add -s user ${MCP_SERVER_NAME} -- ${previous.command} ${previous.args.join(' ')})`;
+    }
+    return { action: 'failed', error: added.stderr || added.stdout || 'claude mcp add failed', rollback };
+  }
+
+  const verified = module.exports.runClaude(buildMcpGetArgs());
   return {
     action: before.present ? 'replaced' : 'added',
     args: addArgs,
@@ -169,9 +183,9 @@ function installMcp({ dryRun, home = os.homedir() }) {
   };
 }
 
-function installWrappers({ dryRun, binDir }) {
+function installWrappers({ dryRun, binDir, nodeExe = 'node' }) {
   const claudeExe = findExecutableInPath('claude', process.platform, process.env, fs) || 'claude';
-  const files = wrapperContents({ root: ROOT, claudeExe });
+  const files = wrapperContents({ root: ROOT, claudeExe, nodeExe: nodeExe || 'node' });
   const written = [];
   const skipped = [];
 
@@ -232,7 +246,7 @@ function main() {
   if (opts.noMcp) {
     result.mcp = { action: 'skipped' };
   } else {
-    result.mcp = installMcp({ dryRun: opts.dryRun });
+    result.mcp = installMcp({ dryRun: opts.dryRun, nodeExe });
     const r = result.mcp;
     if (r.action === 'refused' || r.action === 'failed') {
       log(`  MCP: ${r.action} — ${r.reason || r.error}`);
@@ -245,7 +259,7 @@ function main() {
   if (opts.noWrappers) {
     result.wrappers = { action: 'skipped' };
   } else {
-    result.wrappers = installWrappers({ dryRun: opts.dryRun, binDir });
+    result.wrappers = installWrappers({ dryRun: opts.dryRun, binDir, nodeExe });
     for (const w of result.wrappers.written) log(`  wrapper: ${w.status} ${w.path}`);
     for (const s of result.wrappers.skipped) log(`  wrapper: SKIPPED ${s.name} — ${s.reason}`);
   }
@@ -265,6 +279,11 @@ function main() {
   return 0;
 }
 
+// Exports are assigned BEFORE the main invocation: installMcp routes its
+// subprocess calls through module.exports.runClaude so tests can stub the
+// runner, which only works if the exports object exists while main() runs.
+module.exports = { parseArgs, readUserMcpEntry, checkPrerequisites, secretStatus, installMcp, installWrappers, runClaude };
+
 if (require.main === module) {
   try {
     process.exitCode = main();
@@ -273,5 +292,3 @@ if (require.main === module) {
     process.exitCode = 1;
   }
 }
-
-module.exports = { parseArgs, readUserMcpEntry, checkPrerequisites, secretStatus, installMcp, installWrappers, runClaude };

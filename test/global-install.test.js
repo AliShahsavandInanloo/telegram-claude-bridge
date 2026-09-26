@@ -24,6 +24,7 @@ const path = require('path');
 const launcher = require('../scripts/launch-channel');
 const lib = require('../scripts/global-install-lib');
 const installer = require('../scripts/install-global');
+const { readEnvValue, parseEnvFile, applyEnvFile } = require('../lib/config');
 
 let passed = 0;
 const failures = [];
@@ -171,6 +172,87 @@ async function main() {
     assert.strictEqual(d.ok, true);
   });
 
+  console.log('global install: least-privilege channel configuration');
+
+  await test('parseEnvFile returns key/value pairs WITHOUT mutating the environment', () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, '.env'), [
+      '# comment',
+      'CLAUDE_CHANNEL_PORT=8766',
+      'TELEGRAM_BOT_TOKEN=do-not-import-me',
+      "export QUOTED='quoted value'",
+    ].join('\n'));
+    const env = {};
+    const pairs = parseEnvFile(root, fs);
+    assert.deepStrictEqual(pairs.map((p) => p.key), ['CLAUDE_CHANNEL_PORT', 'TELEGRAM_BOT_TOKEN', 'QUOTED']);
+    assert.strictEqual(pairs[2].value, 'quoted value');
+    assert.deepStrictEqual(env, {}, 'environment untouched by parseEnvFile');
+  });
+
+  await test('applyEnvFile still applies keys with process-env precedence (Bridge behavior unchanged)', () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, '.env'), 'A_KEY=from-file\nPRESET=from-file\n');
+    const env = { PRESET: 'from-process' };
+    const applied = applyEnvFile(root, env, fs);
+    assert.strictEqual(env.A_KEY, 'from-file');
+    assert.strictEqual(env.PRESET, 'from-process');
+    assert.ok(applied.includes('A_KEY') && !applied.includes('PRESET'));
+  });
+
+  await test('readEnvValue: explicit env wins, then .env, then undefined — never mutating', () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, '.env'), 'CLAUDE_CHANNEL_PORT=8766\n');
+    assert.strictEqual(readEnvValue(root, 'CLAUDE_CHANNEL_PORT', { env: { CLAUDE_CHANNEL_PORT: '9100' }, fsImpl: fs }), '9100');
+    assert.strictEqual(readEnvValue(root, 'CLAUDE_CHANNEL_PORT', { env: {}, fsImpl: fs }), '8766');
+    assert.strictEqual(readEnvValue(root, 'MISSING_KEY', { env: {}, fsImpl: fs }), undefined);
+    const env = {};
+    readEnvValue(root, 'CLAUDE_CHANNEL_PORT', { env, fsImpl: fs });
+    assert.deepStrictEqual(env, {}, 'readEnvValue must not mutate the env object');
+  });
+
+  await test('bootstrap reads CLAUDE_CHANNEL_PORT from .env WITHOUT importing unrelated Bridge keys', () => {
+    const root = fakeRoot({ port: '8766' });
+    // The Bridge .env contains unrelated secrets/config the Channel must NOT inherit.
+    fs.writeFileSync(path.join(root, '.env'), [
+      'CLAUDE_CHANNEL_PORT=8766',
+      'TELEGRAM_BOT_TOKEN=bridge-only-token-value',
+      'TELEGRAM_PROXY_URL=http://bridge-only-proxy:8080',
+      'ALLOWED_TELEGRAM_IDS=123456',
+    ].join('\n'));
+    const injected = {}; // a "clean" injected environment
+    const cfg = launcher.bootstrap({ root, env: injected, fsImpl: fs });
+    assert.strictEqual(cfg.port, 8766, 'port resolved from .env');
+    for (const k of ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_PROXY_URL', 'ALLOWED_TELEGRAM_IDS']) {
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(injected, k), false, `${k} must NOT leak into the channel environment`);
+    }
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(injected, 'CLAUDE_CHANNEL_PORT'), false, 'bootstrap itself does not mutate env (applyToEnv does)');
+  });
+
+  await test('bootstrap + applyToEnv exposes ONLY the channel keys in the environment', () => {
+    const root = fakeRoot({ port: '8766' });
+    fs.writeFileSync(path.join(root, '.env'), [
+      'CLAUDE_CHANNEL_PORT=8766',
+      'TELEGRAM_BOT_TOKEN=bridge-only-token-value',
+    ].join('\n'));
+    const injected = {};
+    const cfg = launcher.bootstrap({ root, env: injected, fsImpl: fs });
+    launcher.applyToEnv(cfg, injected);
+    const keys = Object.keys(injected).sort();
+    assert.deepStrictEqual(keys, ['CLAUDE_CHANNEL_PORT', 'CLAUDE_CHANNEL_SECRET'], 'exactly the two channel keys may be exported');
+    assert.ok(!JSON.stringify(keys).includes('TELEGRAM'), 'no Telegram configuration in the channel environment');
+  });
+
+  await test('describe() output never contains Bridge-only .env values', () => {
+    const root = fakeRoot({ port: '8766' });
+    fs.writeFileSync(path.join(root, '.env'), [
+      'CLAUDE_CHANNEL_PORT=8766',
+      'TELEGRAM_BOT_TOKEN=bridge-only-token-value',
+    ].join('\n'));
+    const cfg = launcher.bootstrap({ root, env: {}, fsImpl: fs });
+    const d = JSON.stringify(launcher.describe(cfg));
+    assert.ok(!d.includes('bridge-only-token-value'), 'describe must not leak unrelated .env values');
+  });
+
   console.log('global install: wrapper + MCP argv generation');
 
   await test('wrapperContents stamps the ownership marker on both files', () => {
@@ -188,10 +270,11 @@ async function main() {
   });
 
   await test('bridge wrapper starts the Bridge from the repo root', () => {
-    const files = lib.wrapperContents({ root: 'C:\\bridge', claudeExe: 'claude' });
+    const files = lib.wrapperContents({ root: 'C:\\bridge', claudeExe: 'claude', nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
     const body = files[lib.BRIDGE_CMD];
     assert.ok(body.includes('cd /d "C:\\bridge"'), 'cd to the bridge root');
-    assert.ok(body.includes('node bridge.js'), 'runs the production entrypoint');
+    assert.ok(body.includes('"C:\\Program Files\\nodejs\\node.exe" "C:\\bridge\\bridge.js"'), 'runs the production entrypoint via the pinned node');
+    assert.ok(body.includes('%*'), 'forwards extra arguments');
   });
 
   await test('wrappers contain no secret-shaped content', () => {
@@ -210,6 +293,31 @@ async function main() {
       'node', 'C:\\bridge\\scripts\\launch-channel.js',
     ]);
     assert.ok(!args.join(' ').includes('CLAUDE_CHANNEL_SECRET'), 'no secret on the command line');
+  });
+
+  await test('buildMcpAddArgs uses the ABSOLUTE node executable when given', () => {
+    const args = lib.buildMcpAddArgs({
+      launcherPath: 'C:\\bridge\\scripts\\launch-channel.js',
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+    });
+    assert.deepStrictEqual(args, [
+      'mcp', 'add', '-s', 'user', 'telegram-bridge', '--',
+      'C:\\Program Files\\nodejs\\node.exe', 'C:\\bridge\\scripts\\launch-channel.js',
+    ]);
+  });
+
+  await test('bridge wrapper pins the absolute node executable and preserves spaces', () => {
+    const files = lib.wrapperContents({
+      root: 'C:\\Some Folder\\telegram-claude-bridge',
+      claudeExe: 'C:\\Users\\Test User\\.local\\bin\\claude.exe',
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+    });
+    const bridge = files[lib.BRIDGE_CMD];
+    assert.ok(bridge.includes('"C:\\Program Files\\nodejs\\node.exe"'), 'node pinned and quoted as one argument');
+    assert.ok(bridge.includes('"C:\\Some Folder\\telegram-claude-bridge\\bridge.js"'), 'bridge path quoted as one argument');
+    assert.ok(!/\bnode bridge\.js\b/.test(bridge), 'bare `node` must be gone');
+    const claude = files[lib.CLAUDE_TELEGRAM_CMD];
+    assert.ok(claude.includes('"C:\\Users\\Test User\\.local\\bin\\claude.exe"'), 'claude path quoted with spaces');
   });
 
   await test('buildMcpRemoveArgs targets user scope only', () => {
@@ -261,6 +369,121 @@ async function main() {
       lib.isOwnRegistration({ type: 'http', url: 'http://x', command: 'node', args: [launcherPath] }, { launcherPath, fsImpl: fs }),
       false,
     );
+  });
+
+  await test('isOwnRegistration REJECTS a foreign launch-channel.js with the same basename', () => {
+    // The old fallback accepted ANY existing launch-channel.js — this file must
+    // be classified as NOT ours even though it exists and shares the basename.
+    const otherRoot = tmpDir('tgbridge-foreign-');
+    const foreign = path.join(otherRoot, 'scripts', 'launch-channel.js');
+    fs.mkdirSync(path.dirname(foreign), { recursive: true });
+    fs.writeFileSync(foreign, '// a foreign project launcher', 'utf8');
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    assert.strictEqual(
+      lib.isOwnRegistration({ type: 'stdio', command: 'node', args: [foreign] }, { launcherPath: ours, fsImpl: fs }),
+      false,
+      'same-basename foreign launcher must not be ours',
+    );
+  });
+
+  await test('isOwnRegistration accepts the exact own launcher with different slash/case on Windows', () => {
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    const variant = path.join(libDirRoot(), 'scripts', 'LAUNCH-CHANNEL.js').replace(/\\/g, '/');
+    assert.strictEqual(
+      lib.isOwnRegistration({ type: 'stdio', command: 'node', args: [variant] }, { launcherPath: ours, fsImpl: fs }),
+      true,
+      'Windows ownership comparison is case/slash-insensitive',
+    );
+  });
+
+  await test('samePath: absolute+slash normalization, win32 case-insensitive, posix case-sensitive', () => {
+    assert.strictEqual(lib.samePath('C:\\A\\B\\c.js', 'c:/a/b/C.JS', 'win32'), true);
+    assert.strictEqual(lib.samePath('C:\\A\\B\\c.js', 'C:\\A\\B\\d.js', 'win32'), false);
+    assert.strictEqual(lib.samePath('/a/b/c.js', '/a/b/c.js', 'linux'), true);
+    assert.strictEqual(lib.samePath('/a/b/c.js', '/A/B/c.js', 'linux'), false, 'Unix comparison stays case-sensitive');
+    assert.strictEqual(lib.samePath('relative/path.js', 'relative/path.js', 'win32'), false, 'relative paths never match');
+    assert.strictEqual(lib.samePath('', 'C:\\x', 'win32'), false);
+  });
+
+  await test('isOwnRegistration no longer depends on file existence for moved-path acceptance', () => {
+    // Exact path match must work even if fsImpl says the file does not exist
+    // (e.g. drive not mounted) — ownership is a path comparison, not a lookup.
+    const ours = 'C:\\Does\\Not\\Exist\\scripts\\launch-channel.js';
+    const fakeFs = { existsSync: () => false };
+    assert.strictEqual(
+      lib.isOwnRegistration({ type: 'stdio', command: 'node.exe', args: [ours] }, { launcherPath: ours, fsImpl: fakeFs }),
+      true,
+    );
+  });
+
+  await test('installMcp refuses a foreign SAME-BASENAME registration (no removal, no replace)', () => {
+    const home = tmpDir();
+    const otherRoot = tmpDir('tgbridge-foreign2-');
+    const foreign = path.join(otherRoot, 'scripts', 'launch-channel.js');
+    fs.mkdirSync(path.dirname(foreign), { recursive: true });
+    fs.writeFileSync(foreign, '// foreign launcher', 'utf8');
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [foreign] } } }),
+      'utf8',
+    );
+    const res = installer.installMcp({ dryRun: true, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+    assert.strictEqual(res.action, 'refused', 'foreign same-basename registration must be refused');
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
+    assert.deepStrictEqual(parsed.mcpServers['telegram-bridge'].args, [foreign], 'foreign config untouched');
+    assert.ok(!res.args, 'no add planned');
+  });
+
+  await test('uninstall refusals + removals are decided by exact ownership (dry-run)', () => {
+    const otherRoot = tmpDir('tgbridge-foreign3-');
+    const foreign = path.join(otherRoot, 'scripts', 'launch-channel.js');
+    fs.mkdirSync(path.dirname(foreign), { recursive: true });
+    fs.writeFileSync(foreign, '// foreign', 'utf8');
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    const { isOwnRegistration } = lib;
+    // Foreign (even with an existing file) must be removable-eligible only via --force.
+    assert.strictEqual(isOwnRegistration({ command: 'node', args: [foreign] }, { launcherPath: ours, fsImpl: fs }), false);
+    // Our exact path is ours.
+    assert.strictEqual(isOwnRegistration({ command: 'node', args: [ours] }, { launcherPath: ours, fsImpl: fs }), true);
+  });
+
+  await test('installMcp dry-run shows the pinned absolute node executable', () => {
+    const home = tmpDir();
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: {} }), 'utf8');
+    const res = installer.installMcp({ dryRun: true, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+    assert.strictEqual(res.action, 'add');
+    assert.ok(res.args.includes('C:\\Program Files\\nodejs\\node.exe'), 'dry-run argv carries the real executable');
+    assert.ok(!res.args.includes('node'), 'bare node gone from argv');
+  });
+
+  await test('installMcp plans a rollback of the previous registration when add fails (non-dry-run, stubbed runClaude)', () => {
+    const home = tmpDir();
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [ours] } } }),
+      'utf8',
+    );
+    const calls = [];
+    let addCalls = 0;
+    const origRun = installer.runClaude;
+    installer.runClaude = (args) => {
+      calls.push(args);
+      if (args[1] === 'add') {
+        addCalls += 1;
+        if (addCalls === 1) return { ok: false, stderr: 'simulated add failure' }; // the FIRST add fails
+      }
+      return { ok: true, stdout: 'ok' };
+    };
+    try {
+      const res = installer.installMcp({ dryRun: false, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+      assert.strictEqual(res.action, 'failed');
+      assert.strictEqual(res.rollback, 'previous registration restored', 'rollback attempted and reported');
+      assert.strictEqual(calls.length, 3, 'remove -> add -> rollback add');
+      assert.deepStrictEqual(calls[2].slice(4), ['telegram-bridge', '--', 'node', ours], 'rollback re-adds the PREVIOUS registration');
+    } finally {
+      installer.runClaude = origRun;
+    }
   });
 
   await test('readUserMcpEntry finds a user-scope server in an injected home', () => {

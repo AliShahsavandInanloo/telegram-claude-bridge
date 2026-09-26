@@ -25,10 +25,17 @@
  *   - The secret is never logged. Errors name the file, never the value.
  *
  * Configuration resolution (single source of truth):
- *   port   -> <root>/.env  CLAUDE_CHANNEL_PORT   (fallback 8765, matching bridge.js)
+ *   port   -> CLAUDE_CHANNEL_PORT from the real environment, else <root>/.env,
+ *             else 8765 (matching bridge.js)
  *   secret -> CLAUDE_CHANNEL_SECRET_FILE if set, else <root>/state/channel-secret
  *             (an explicitly exported CLAUDE_CHANNEL_SECRET still wins, so the
  *             documented manual/local mode keeps working)
+ *
+ * LEAST PRIVILEGE: this launcher NEVER imports the Bridge's whole .env into
+ * its environment. Unrelated Bridge values (TELEGRAM_BOT_TOKEN,
+ * ALLOWED_TELEGRAM_IDS, TELEGRAM_PROXY_URL, ...) must never appear in the
+ * Channel MCP process. Only the Channel's own keys are read, via the
+ * non-mutating readEnvValue() helper.
  */
 
 const fs = require('fs');
@@ -39,7 +46,7 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_CHANNEL_PORT = 8765; // mirrors bridge.js intEnv(..., { def: 8765 })
 const MIN_SECRET_LENGTH = 16; // mirrors the guard in lib/channel/claude-channel.js
 
-const { applyEnvFile, intEnv } = require(path.join(ROOT, 'lib', 'config.js'));
+const { readEnvValue, intEnv } = require(path.join(ROOT, 'lib', 'config.js'));
 
 /**
  * Where the channel secret is read from. An explicit CLAUDE_CHANNEL_SECRET_FILE
@@ -78,10 +85,11 @@ function readSecretFile(file, fsImpl = fs) {
  * Pure with respect to injected dependencies, so it is unit-testable.
  */
 function bootstrap({ root = ROOT, env = process.env, fsImpl = fs } = {}) {
-  // .env supplies the port; real environment variables keep precedence.
-  applyEnvFile(root, env, fsImpl);
+  // .env supplies ONLY the Channel's own port value; the real environment
+  // keeps precedence and NOTHING from .env is copied into the environment.
+  const portRaw = readEnvValue(root, 'CLAUDE_CHANNEL_PORT', { env, fsImpl });
 
-  const portCheck = intEnv(env.CLAUDE_CHANNEL_PORT, {
+  const portCheck = intEnv(portRaw, {
     name: 'CLAUDE_CHANNEL_PORT',
     def: DEFAULT_CHANNEL_PORT,
     min: 1024,

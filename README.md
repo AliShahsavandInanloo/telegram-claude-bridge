@@ -93,12 +93,14 @@ never modified. The MCP server is registered at **user scope**, so
 projects)"*.
 
 **How the port and secret are resolved.** The registered entry point is
-`scripts/launch-channel.js`. It reads the Bridge `.env` for
-`CLAUDE_CHANNEL_PORT` (one source of truth — no hardcoded port), reads the hub
-secret from `state/channel-secret` (or `CLAUDE_CHANNEL_SECRET_FILE`), exports
-both into its own process, and runs the Channel in-process. The secret is never
-stored in the MCP configuration, never committed, never on a command line, and
-never printed.
+`scripts/launch-channel.js`. It reads **only** the Channel's own configuration —
+`CLAUDE_CHANNEL_PORT` from the environment or the Bridge `.env` (one source of
+truth — no hardcoded port) — and the hub secret from `state/channel-secret`
+(or `CLAUDE_CHANNEL_SECRET_FILE`), then exports just those two values into its
+own process and runs the Channel in-process. The rest of the Bridge `.env`
+(`TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_IDS`, `TELEGRAM_PROXY_URL`, …) is
+**never** loaded into the Channel process. The secret is never stored in the
+MCP configuration, never committed, never on a command line, and never printed.
 
 ```cmd
 npm run install-global          # idempotent — replaces its own entry, never duplicates
