@@ -587,7 +587,11 @@ function fakeChild() {
     exitCode: null,
     signalCode: null,
     stdin: { write: () => {}, on: () => {} },
-    stdout: { on: () => {} },
+    stdout: {
+      on: (ev, fn) => {
+        (handlers['out:' + ev] = handlers['out:' + ev] || []).push(fn);
+      },
+    },
     stderr: { on: () => {} },
     on: (ev, fn) => {
       (handlers[ev] = handlers[ev] || []).push(fn);
@@ -595,12 +599,40 @@ function fakeChild() {
     kill() {
       (handlers.close || []).forEach((f) => f(0, null));
     },
+    fireOut(data) {
+      (handlers['out:data'] || []).forEach((f) => f(Buffer.from(data)));
+    },
   };
 }
 
 /** Real manager over a real temp registry; debounce disabled (explicit flush only). */
 function makeManager(reg, saveDelayMs = 100000) {
   return createClaudeManager({ reg, launch: LAUNCH, spawnFn: () => fakeChild(), logInfo: () => {}, logError: () => {}, saveDelayMs });
+}
+
+/** Same, but captures every spawned child so tests can emit Claude events. */
+function makeManagerCapturing(reg, children, saveDelayMs = 100000) {
+  return createClaudeManager({
+    reg,
+    launch: LAUNCH,
+    spawnFn: () => {
+      const c = fakeChild();
+      children.push(c);
+      return c;
+    },
+    logInfo: () => {},
+    logError: () => {},
+    saveDelayMs,
+  });
+}
+
+/** Poll until predicate() is true (bounded; deterministic ordering gate). */
+async function waitFor(predicate, label, tries = 200) {
+  for (let i = 0; i < tries; i++) {
+    if (predicate()) return;
+    await sleep(5);
+  }
+  throw new Error(`waitFor timed out: ${label}`);
 }
 
 /** Hold the global registry transaction until release() is called. */
@@ -882,6 +914,165 @@ test('manager create/attach/detach/route complete normally under the new transac
   assert.strictEqual(reg.attached('3'), null);
   assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
   mgr.stopAll();
+});
+
+// ---------------------------------------------------------------------------
+// 3b. Manager-OWNED transactions: unrelated async events must never join the
+//     in-flight transaction (the txnDepth context-leak bug). These tests use a
+//     manager-owned create/attach transaction with a HELD save — the case an
+//     externally-held reg.withTransaction cannot reproduce.
+// ---------------------------------------------------------------------------
+
+test('manager-owned txn: stopSession during a FAILING attach is not erased by the attach rollback', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  const b = reg.create({ name: 'beta', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+  assert.strictEqual(children.length, 1, 'managed process for A spawned');
+
+  // Manager-OWNED transaction: attach B, save held open (registry lock owned).
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  let attachSettled = false;
+  const attachP = mgr.attach('1', b.id).then((r) => {
+    attachSettled = true;
+    return r;
+  });
+  await waitFor(() => ctl.deferreds.length === 1, 'attach save reached');
+
+  // Unrelated lifecycle event while the attach transaction owns the lock.
+  const stop = mgr.stopSession(a.id, 'user stop');
+  assert.ok(stop.ok, 'stopSession still returns its runtime result immediately');
+  assert.strictEqual(attachSettled, false, 'attach still pending');
+  assert.strictEqual(reg.get(a.id).status, 'idle', 'status is NOT mutated while the attach txn holds the registry');
+
+  // attach save fails → the attach rolls back to its own snapshot.
+  ctl.deferreds[0].reject(new Error('disk gone'));
+  const attachResult = await attachP;
+  assert.strictEqual(attachResult.ok, false, 'attach reports failure');
+  assert.strictEqual(reg.attached('1'), null, 'attach rolled back');
+  assert.strictEqual(reg.get(a.id).status, 'idle', 'attach rollback restored only attach state');
+
+  // Flush queued manager updates: the stopped intent survives the rollback.
+  reg.save = origSave;
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(a.id).status, 'stopped', 'stopped status intent survived the unrelated rollback');
+  const reread = createRegistry(file);
+  assert.strictEqual(reread.get(a.id).status, 'stopped', 'stopped status persisted to disk');
+  await sleep(10);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager-owned txn: status queued during a SUCCESSFUL attach commits after it (both survive)', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  const b = reg.create({ name: 'beta', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  const attachP = mgr.attach('2', b.id);
+  await waitFor(() => ctl.deferreds.length === 1, 'attach save reached');
+  mgr.stopSession(a.id, 'stop');
+  assert.strictEqual(reg.get(a.id).status, 'idle', 'status staged while the attach txn is pending');
+
+  ctl.deferreds[0].resolve();
+  const r = await attachP;
+  assert.ok(r.ok, 'attach committed');
+  assert.strictEqual(reg.attached('2').id, b.id, 'attachment durable');
+
+  reg.save = origSave;
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(a.id).status, 'stopped', 'queued status committed after the attach');
+  await sleep(10);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager-owned txn: claudeSessionId from system/init during a FAILING attach is NOT erased', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  const b = reg.create({ name: 'beta', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+  const child = children[0];
+  const UUID = '0e5b3a2e-1d2f-4c6b-9a3f-000000000123';
+
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  const attachP = mgr.attach('3', b.id);
+  await waitFor(() => ctl.deferreds.length === 1, 'attach save reached');
+
+  // The real createManagedSession -> onClaudeSessionId path fires while the
+  // attach transaction owns the registry: it must be staged, not mutated.
+  child.fireOut(JSON.stringify({ type: 'system', subtype: 'init', session_id: UUID }) + '\n');
+  assert.strictEqual(reg.get(a.id).claudeSessionId, null, 'session id staged, not mutated, while the attach txn holds the lock');
+
+  ctl.deferreds[0].reject(new Error('disk gone'));
+  const ar = await attachP;
+  assert.strictEqual(ar.ok, false, 'attach reports failure');
+  assert.strictEqual(reg.get(a.id).claudeSessionId, null, 'attach rollback cannot touch the staged session id');
+
+  reg.save = origSave;
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(a.id).claudeSessionId, UUID, 'session id applied after the unrelated rollback');
+  assert.strictEqual(reg.get(a.id).initialized, true, 'initialized flag set with the session id');
+  const reread = createRegistry(file);
+  assert.strictEqual(reread.get(a.id).claudeSessionId, UUID, 'session id persisted to disk');
+});
+
+test('manager status coalescing: last intended status wins before flush', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const e = reg.create({ name: 'coalesce', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(e.id); // 'starting'
+  mgr.stopSession(e.id, 'stop'); // 'stopped' — should win
+  assert.strictEqual(reg.get(e.id).status, 'idle', 'live registry untouched before the flush');
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(e.id).status, 'stopped', 'only the latest intended status is applied');
+});
+
+test('manager session-id coalescing: last valid id wins; invalid ids are rejected', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const e = reg.create({ name: 'coalesceid', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(e.id);
+  const child = children[0];
+  const X = '0e5b3a2e-1d2f-4c6b-9a3f-00000000000a';
+  const Y = '0e5b3a2e-1d2f-4c6b-9a3f-00000000000b';
+  child.fireOut(JSON.stringify({ type: 'system', subtype: 'init', session_id: X }) + '\n');
+  child.fireOut(JSON.stringify({ type: 'system', subtype: 'init', session_id: Y }) + '\n');
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(e.id).claudeSessionId, Y, 'last valid session id wins');
+  child.fireOut(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'not-a-uuid' }) + '\n');
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(e.id).claudeSessionId, Y, 'invalid session id rejected; previous value preserved');
 });
 
 // ---------------------------------------------------------------------------

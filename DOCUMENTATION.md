@@ -583,7 +583,15 @@ cannot be erased by a concurrent whole-registry rollback. High-frequency,
 low-value fields (session `status`, `claudeSessionId`, `lastActivity`) are
 queued OUTSIDE the registry and applied — with a single save — inside ONE
 registry transaction per burst; the live registry is never mutated before
-the lock is held. Only one full-registry
+the lock is held. The manager never infers transaction context from a shared
+counter/flag — an unrelated async event (child exit, kill, task completion,
+`system/init`) can never join whichever manager transaction happens to be in
+flight; it is always staged and applied by a later flush. If a queued flush
+fails to save, the registry snapshot is restored and the latest intent is
+re-queued for the NEXT flush (a later update or shutdown) — there is no
+automatic retry loop, so a persistently broken disk leaves the latest status /
+session-id intent pending in memory rather than corrupting the registry. Only
+one full-registry
 snapshot → mutate → persist → commit/restore cycle may run at a time, so a
 failed registration for client X can never roll back a successfully
 committed transaction for client Y, and a superseded candidate restores its
