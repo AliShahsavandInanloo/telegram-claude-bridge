@@ -146,6 +146,56 @@ In your bot's chat:
 Then just send a normal message — it appears inside your live Claude Code
 session, and Claude replies back into Telegram.
 
+## Connect Telegram to an existing Claude Code chat
+
+### If Claude Code was started with plain `claude`
+
+A Channel cannot be injected into an already-running process. To keep the same
+conversation, resume it with the Channel:
+
+1. Exit the current Claude Code session.
+2. From the same project directory, run:
+
+   ```
+   claude-telegram --continue
+   ```
+
+3. Start the Bridge if it is not already running:
+
+   ```
+   telegram-claude-bridge
+   ```
+
+4. In Telegram, run `/sessions` and find the corresponding `[CHANNEL]` session.
+5. Switch Telegram to it: `/switch <session-name>`.
+
+Normal Telegram messages now go to that specific resumed Claude conversation.
+To resume a particular session instead of the most recent one:
+
+```
+claude-telegram --resume <session-id>
+```
+
+### If Claude Code was already started with `claude-telegram`
+
+No Claude restart is needed. If the Bridge was stopped, start it again:
+
+```
+telegram-claude-bridge
+```
+
+The Channel reconnects automatically. Then run `/sessions` and `/switch
+<session-name>` in Telegram if the chat is not already attached.
+
+### Important distinction
+
+- `claude` — normal Claude Code session, no Bridge Channel loaded
+- `claude-telegram` — Claude Code session with the `telegram-bridge` Channel
+  loaded
+
+A running plain `claude` process can never be attached retroactively; it must
+be resumed through `claude-telegram` as shown above.
+
 ## Install with an AI coding agent (optional)
 
 An AI agent can perform the whole install for you — using the same supported

@@ -532,6 +532,24 @@ supported):
 3. `claude --dangerously-load-development-channels server:telegram-bridge`
    and accept the development-channels prompt.
 
+**Reconnecting Telegram to an existing conversation.** The wrapper passes all
+extra arguments through to `claude` (`%*` on Windows, `"$@"` in the POSIX
+wrappers), so the standard conversation-selection flags work directly:
+
+- If the project's Claude Code session was started with **plain `claude`**, a
+  Channel cannot be injected into the running process. Exit it, then from the
+  same project directory run `claude-telegram --continue` (resume the most
+  recent conversation) or `claude-telegram --resume <session-id>` (resume a
+  specific session). Start `telegram-claude-bridge` if it is not running,
+  then `/sessions` → `/switch <session-name>` in Telegram.
+- If the session was already started with **`claude-telegram`**, no Claude
+  restart is needed: restart the Bridge if it was stopped — the channel
+  client reconnects automatically (bounded backoff, stable hub port) — and
+  the chat's existing `/attach`/`/switch` mapping becomes active again.
+
+A running plain `claude` process can never be attached retroactively; the
+conversation must be resumed through `claude-telegram`.
+
 The channel authenticates with the hub secret (random 32-byte value in
 `state/channel-secret`, mode 0600). It is NOT the bot token, NOT an API key,
 and never leaves the machine. The Bridge validates every `reply`/`send_file`
