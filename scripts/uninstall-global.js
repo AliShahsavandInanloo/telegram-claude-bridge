@@ -30,7 +30,10 @@ const {
   buildMcpRemoveArgs,
   isOwnRegistration,
 } = require('./global-install-lib.js');
-const { parseArgs, readUserMcpEntry, runClaude } = require('./install-global.js');
+const installer = require('./install-global.js');
+const { readUserMcpEntry } = installer;
+// Routed through the module object so tests can stub the claude CLI runner.
+const runClaude = (...a) => installer.runClaude(...a);
 
 const HELP = `uninstall-global — remove this project's global integrations
 
@@ -39,12 +42,39 @@ Usage: node scripts/uninstall-global.js [options]
   --dry-run        show what would change, touch nothing
   --bin-dir <dir>  directory holding the wrapper commands (default ~/.local/bin)
   --force          remove the user-scope MCP server even if it does not look like ours
+                   (MCP ONLY — wrapper files are still deleted only when they
+                   carry this installer's ownership marker)
   --json           print a machine-readable summary
   --help
 `;
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+/**
+ * uninstall-global's OWN argument parser (the installer's parser does not
+ * know --force and must not silently accept installer-only flags).
+ * Supported: --dry-run, --bin-dir <dir>, --force, --json, --help.
+ */
+function parseUninstallArgs(argv) {
+  const opts = { dryRun: false, binDir: null, force: false, json: false, help: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--dry-run') opts.dryRun = true;
+    else if (a === '--force') opts.force = true;
+    else if (a === '--json') opts.json = true;
+    else if (a === '--help' || a === '-h') opts.help = true;
+    else if (a === '--bin-dir') {
+      if (i + 1 >= argv.length) throw new Error('--bin-dir requires a directory argument');
+      opts.binDir = argv[i + 1];
+      i += 1;
+    }
+    else if (a.startsWith('--bin-dir=')) opts.binDir = a.slice('--bin-dir='.length);
+    else if (a.startsWith('--')) throw new Error(`unknown option: ${a}`);
+    else throw new Error(`unexpected positional argument: ${a}`);
+  }
+  return opts;
+}
+
+function main(argv = process.argv.slice(2)) {
+  const opts = parseUninstallArgs(argv);
   if (opts.help) {
     process.stdout.write(HELP);
     return 0;
@@ -67,7 +97,9 @@ function main() {
   } else {
     if (!opts.dryRun) {
       const res = runClaude(buildMcpRemoveArgs());
-      result.mcp = res.ok ? { action: 'removed' } : { action: 'failed', error: res.stderr || res.stdout };
+      // A failed removal MUST fail the uninstall (non-zero): automation and
+      // AI agents must never believe a server was removed when it was not.
+      result.mcp = res.ok ? { action: 'removed' } : { action: 'failed', error: res.stderr || res.stdout || 'claude mcp remove failed' };
     } else {
       result.mcp = { action: 'remove', dryRun: true };
     }
@@ -96,8 +128,14 @@ function main() {
 
   log('');
   log('Bridge data (state/, .env, node_modules) was left untouched.');
+  // Exit status must reflect reality: a failed MCP removal (or any failure)
+  // makes the uninstall non-zero even though this function still completes.
+  const failed = result.mcp && result.mcp.action === 'failed';
+  if (failed) {
+    process.stderr.write(`error: MCP removal failed: ${result.mcp.error}\n`);
+  }
   if (opts.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  return 0;
+  return failed ? 1 : 0;
 }
 
 if (require.main === module) {
@@ -109,4 +147,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main };
+module.exports = { main, parseUninstallArgs };

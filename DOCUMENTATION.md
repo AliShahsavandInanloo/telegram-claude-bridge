@@ -753,6 +753,32 @@ PATH Claude Code or the invoking shell inherits. If replacing an existing own
 registration fails after the old entry was removed, the installer attempts to
 restore the previous registration and reports the rollback result.
 
+**Claude launch resolution.** The installer resolves Claude with the Bridge's
+own safe resolver (`resolveClaudeLaunch`), so both native `claude.exe`
+installations and Windows `.cmd`/`.bat` shims (npm-style `node …claude-cli.js`
+launchers) are supported: every `claude mcp …` call runs
+`execFileSync(command, [...prefixArgs, args], { shell: false })`, and
+`claude-telegram.cmd` bakes in the resolved launch spec (native exe, or
+`"node.exe" "claude-cli.js" --dangerously-load-development-channels …`). An
+unmodelable shim fails with the resolver's clear error — the installer never
+guesses.
+
+**Wrapper directory is verified, not assumed.** `~/.local/bin` is used when it
+is actually on PATH; otherwise the npm global bin directory (`%APPDATA%\npm`)
+is used when *it* is on PATH; otherwise the install fails with remediation:
+`npm run install-global -- --bin-dir "<user-writable directory already on PATH>"`.
+PATH is never modified automatically, and system/administrator directories are
+never written to just because they happen to be on PATH. An explicit
+`--bin-dir` that is not on PATH is honored but reported as a partial install.
+
+**Exit statuses are honest.** A skipped (unmanaged) wrapper, an off-PATH bin
+dir, a failed MCP verification, or a refused/failed registration all produce a
+**non-zero** exit — a zero exit means the requested installation completed.
+`npm run uninstall-global -- --force` removes a foreign `telegram-bridge` MCP
+registration, but wrapper files are still deleted only when they carry this
+installer's marker, and a failed `claude mcp remove` makes the uninstall exit
+non-zero.
+
 **Verifying from an unrelated directory** (no `.mcp.json` present):
 
 ```cmd

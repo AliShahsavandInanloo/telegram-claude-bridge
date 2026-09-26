@@ -24,7 +24,8 @@ const path = require('path');
 const launcher = require('../scripts/launch-channel');
 const lib = require('../scripts/global-install-lib');
 const installer = require('../scripts/install-global');
-const { readEnvValue, parseEnvFile, applyEnvFile } = require('../lib/config');
+const uninstaller = require('../scripts/uninstall-global');
+const { readEnvValue, parseEnvFile, applyEnvFile, resolveClaudeLaunch, parseShimLaunch } = require('../lib/config');
 
 let passed = 0;
 const failures = [];
@@ -454,6 +455,357 @@ async function main() {
     assert.strictEqual(res.action, 'add');
     assert.ok(res.args.includes('C:\\Program Files\\nodejs\\node.exe'), 'dry-run argv carries the real executable');
     assert.ok(!res.args.includes('node'), 'bare node gone from argv');
+  });
+
+  // ------------------------------------------------------------------------
+  // Portability pass: --force parsing, uninstall exit status, Claude launch
+  // specs, PATH-verified bin dirs, honest partial-install reporting.
+  // ------------------------------------------------------------------------
+
+  console.log('global install: uninstall argument parsing (--force)');
+
+  await test('parseUninstallArgs accepts --force alone and with --dry-run', () => {
+    const a = uninstaller.parseUninstallArgs(['--force']);
+    assert.strictEqual(a.force, true);
+    assert.strictEqual(a.dryRun, false);
+    const b = uninstaller.parseUninstallArgs(['--force', '--dry-run']);
+    assert.strictEqual(b.force, true);
+    assert.strictEqual(b.dryRun, true);
+  });
+
+  await test('parseUninstallArgs accepts --bin-dir in both forms', () => {
+    const a = uninstaller.parseUninstallArgs(['--bin-dir', 'D:\\bin']);
+    assert.strictEqual(a.binDir, 'D:\\bin');
+    const b = uninstaller.parseUninstallArgs(['--bin-dir=D:\\bin']);
+    assert.strictEqual(b.binDir, 'D:\\bin');
+  });
+
+  await test('parseUninstallArgs rejects unknown options and missing --bin-dir value', () => {
+    assert.throws(() => uninstaller.parseUninstallArgs(['--no-mcp']), /unknown option: --no-mcp/);
+    assert.throws(() => uninstaller.parseUninstallArgs(['--no-wrappers']), /unknown option: --no-wrappers/);
+    assert.throws(() => uninstaller.parseUninstallArgs(['--wat']), /unknown option: --wat/);
+    assert.throws(() => uninstaller.parseUninstallArgs(['--bin-dir']), /--bin-dir requires a directory argument/);
+    assert.throws(() => uninstaller.parseUninstallArgs(['stray']), /unexpected positional/);
+  });
+
+  await test('uninstall --force --dry-run runs and mutates nothing (end-to-end main)', () => {
+    const otherRoot = tmpDir('tgbridge-force1-');
+    const foreign = path.join(otherRoot, 'scripts', 'launch-channel.js');
+    fs.mkdirSync(path.dirname(foreign), { recursive: true });
+    fs.writeFileSync(foreign, '// foreign launcher', 'utf8');
+    const home = tmpDir();
+    const claudeJson = path.join(home, '.claude.json');
+    fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [foreign] } } }), 'utf8');
+    const binDir = tmpDir();
+    const realHomedir = os.homedir;
+    os.homedir = () => home;
+    try {
+      const code = uninstaller.main.call(null, ['--force', '--dry-run', '--bin-dir', binDir]);
+      assert.strictEqual(code, 0, 'valid dry run exits 0');
+      const parsed = JSON.parse(fs.readFileSync(claudeJson, 'utf8'));
+      assert.deepStrictEqual(parsed.mcpServers['telegram-bridge'].args, [foreign], 'dry run removes nothing');
+    } finally {
+      os.homedir = realHomedir;
+    }
+  });
+
+  await test('foreign MCP survives a NORMAL uninstall but is removed with --force (removal CLI invoked only when forced)', () => {
+    const otherRoot = tmpDir('tgbridge-force2-');
+    const foreign = path.join(otherRoot, 'scripts', 'launch-channel.js');
+    fs.mkdirSync(path.dirname(foreign), { recursive: true });
+    fs.writeFileSync(foreign, '// foreign launcher', 'utf8');
+    const home = tmpDir();
+    const claudeJson = path.join(home, '.claude.json');
+    const writeConfig = () => fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [foreign] } } }), 'utf8');
+    const realHomedir = os.homedir;
+    const realRun = installer.runClaude;
+    os.homedir = () => home;
+    // Stub the claude CLI and record every removal invocation.
+    const removals = [];
+    installer.runClaude = (args) => {
+      if (args[1] === 'remove') removals.push(args);
+      return { ok: true, stdout: 'removed' };
+    };
+    try {
+      writeConfig();
+      let code = uninstaller.main(['--bin-dir', tmpDir()]);
+      assert.strictEqual(code, 0);
+      assert.strictEqual(removals.length, 0, 'NO claude mcp remove without --force');
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(claudeJson, 'utf8')).mcpServers['telegram-bridge'].args, [foreign], 'foreign registration SURVIVES without --force');
+
+      writeConfig();
+      code = uninstaller.main(['--force', '--bin-dir', tmpDir()]);
+      assert.strictEqual(code, 0, 'forced removal of a foreign registration succeeds');
+      assert.strictEqual(removals.length, 1, '--force invokes claude mcp remove exactly once');
+      assert.deepStrictEqual(removals[0], ['mcp', 'remove', '-s', 'user', 'telegram-bridge'], 'removal is user-scoped');
+    } finally {
+      os.homedir = realHomedir;
+      installer.runClaude = realRun;
+    }
+  });
+
+  await test('failed claude mcp remove makes uninstall exit non-zero with a precise error', () => {
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    const claudeJson = path.join(tmpDir(), '.claude.json');
+    fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [ours] } } }), 'utf8');
+    const realHomedir = os.homedir;
+    const realRun = installer.runClaude;
+    os.homedir = () => path.dirname(claudeJson);
+    installer.runClaude = () => ({ ok: false, stderr: 'simulated claude mcp remove failure' });
+    try {
+      const code = uninstaller.main(['--bin-dir', tmpDir()]);
+      assert.strictEqual(code, 1, 'failed removal must exit non-zero');
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(claudeJson, 'utf8')).mcpServers['telegram-bridge'].args, [ours], 'config untouched when removal fails');
+    } finally {
+      os.homedir = realHomedir;
+      installer.runClaude = realRun;
+    }
+  });
+
+  await test('--force never deletes unmanaged wrapper files (MCP override is MCP-only)', () => {
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    const claudeJson = path.join(tmpDir(), '.claude.json');
+    fs.writeFileSync(claudeJson, JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [ours] } } }), 'utf8');
+    const binDir = tmpDir();
+    const clash = path.join(binDir, lib.CLAUDE_TELEGRAM_CMD);
+    fs.writeFileSync(clash, '@echo off\r\necho hand written\r\n', 'utf8');
+    const realHomedir = os.homedir;
+    const realRun = installer.runClaude;
+    os.homedir = () => path.dirname(claudeJson);
+    installer.runClaude = () => ({ ok: true, stdout: 'removed' });
+    try {
+      const code = uninstaller.main(['--force', '--bin-dir', binDir]);
+      assert.strictEqual(code, 0);
+      assert.strictEqual(fs.readFileSync(clash, 'utf8'), '@echo off\r\necho hand written\r\n', 'unmanaged wrapper untouched even with --force');
+    } finally {
+      os.homedir = realHomedir;
+      installer.runClaude = realRun;
+    }
+  });
+
+  console.log('global install: Claude launch specs (.cmd/.bat shim support)');
+
+  await test('resolveClaudeLaunch accepts a native claude.exe', () => {
+    const root = tmpDir();
+    const exe = path.join(root, 'claude.exe');
+    fs.writeFileSync(exe, 'MZ', 'utf8');
+    const spec = resolveClaudeLaunch(exe, { fsImpl: fs, platform: 'win32' });
+    assert.ok(spec.ok, spec.error);
+    assert.strictEqual(spec.command, path.resolve(exe));
+    assert.deepStrictEqual(spec.prefixArgs, []);
+  });
+
+  await test('resolveClaudeLaunch models a node-invoking claude.cmd shim safely', () => {
+    const root = tmpDir();
+    const nodeExe = path.join(root, 'node.exe');
+    const cliJs = path.join(root, 'node_modules', 'claude', 'cli.js');
+    fs.mkdirSync(path.dirname(cliJs), { recursive: true });
+    fs.writeFileSync(nodeExe, 'MZ', 'utf8');
+    fs.writeFileSync(cliJs, '// cli', 'utf8');
+    const shim = path.join(root, 'claude.cmd');
+    fs.writeFileSync(shim, `@echo off\r\nnode  "%~dp0\\node_modules\\claude\\cli.js" %*\r\n`, 'utf8');
+    const shimSpec = parseShimLaunch(shim, fs);
+    assert.ok(shimSpec, 'shim must be modelable');
+    // The shim's bare `node` resolves against the injected PATH.
+    const env = { PATH: root };
+    const spec = resolveClaudeLaunch('claude', { fsImpl: fs, platform: 'win32', env, nodeExe });
+    assert.ok(spec.ok, spec.error);
+    assert.strictEqual(path.basename(spec.command).toLowerCase(), 'node.exe');
+    assert.strictEqual(spec.prefixArgs.length, 1);
+    assert.ok(spec.prefixArgs[0].toLowerCase().endsWith('cli.js'));
+  });
+
+  await test('an unmodelable shim fails with the resolver error (never guessed)', () => {
+    const root = tmpDir();
+    const shim = path.join(root, 'claude.cmd');
+    fs.writeFileSync(shim, '@echo off\r\nstart-something-weird --flag', 'utf8');
+    const env = { PATH: root };
+    const spec = resolveClaudeLaunch('claude', { fsImpl: fs, platform: 'win32', env });
+    assert.strictEqual(spec.ok, false);
+    assert.ok(/Unable to safely resolve/.test(spec.error));
+  });
+
+  await test('runClaude executes through the resolved launch spec (prefixArgs honored)', () => {
+    const calls = [];
+    const childProcess = require('child_process');
+    const origExec = childProcess.execFileSync;
+    childProcess.execFileSync = (cmd, args, opts) => {
+      calls.push({ cmd, args, opts });
+      return 'ok';
+    };
+    try {
+      const launch = { command: 'C:\\Program Files\\nodejs\\node.exe', prefixArgs: ['C:\\claude\\cli.js'] };
+      const r = installer.runClaude(['mcp', 'get', 'telegram-bridge'], launch);
+      assert.ok(r.ok);
+      assert.strictEqual(calls.length, 1);
+      assert.strictEqual(calls[0].cmd, launch.command);
+      assert.deepStrictEqual(calls[0].args, [...launch.prefixArgs, 'mcp', 'get', 'telegram-bridge'], 'prefixArgs precede the claude argv');
+      assert.strictEqual(calls[0].opts.shell, false, 'never a shell');
+    } finally {
+      childProcess.execFileSync = origExec;
+    }
+  });
+
+  await test('runClaude without a resolvable claude returns a clean failure (no throw)', () => {
+    const r = installer.runClaude(['mcp', 'get'], { ok: false, command: null, prefixArgs: null, error: 'resolver error text' });
+    assert.strictEqual(r.ok, false);
+    assert.ok(/resolver error text/.test(r.stderr));
+  });
+
+  await test('claude wrapper uses the launch spec: native exe', () => {
+    const files = lib.wrapperContents({
+      root: 'C:\\bridge',
+      claudeLaunch: { command: 'C:\\Users\\Test User\\.local\\bin\\claude.exe', prefixArgs: [] },
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+    });
+    const body = files[lib.CLAUDE_TELEGRAM_CMD];
+    assert.ok(body.includes('"C:\\Users\\Test User\\.local\\bin\\claude.exe" --dangerously-load-development-channels server:telegram-bridge %*'));
+  });
+
+  await test('claude wrapper uses the launch spec: node + cli.js shim', () => {
+    const files = lib.wrapperContents({
+      root: 'C:\\bridge',
+      claudeLaunch: { command: 'C:\\Program Files\\nodejs\\node.exe', prefixArgs: ['C:\\Users\\Test User\\AppData\\claude-cli.js'] },
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+    });
+    const body = files[lib.CLAUDE_TELEGRAM_CMD];
+    assert.ok(body.includes('"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Test User\\AppData\\claude-cli.js" --dangerously-load-development-channels server:telegram-bridge %*'), 'shim invocation is two quoted argv elements');
+  });
+
+  await test('claudeInvocation quotes every argv element so spaces survive', () => {
+    const line = lib.claudeInvocation({ command: 'C:\\Pro gram\\claude.exe', prefixArgs: ['C:\\a b\\x.js'] }, '--flag');
+    assert.strictEqual(line, '"C:\\Pro gram\\claude.exe" "C:\\a b\\x.js" --flag %*');
+  });
+
+  console.log('global install: PATH-verified bin directory');
+
+  await test('isDirectoryOnPath: present, absent, case-insensitive on Windows, case-sensitive on POSIX', () => {
+    const env = { PATH: 'C:\\Users\\x\\.local\\bin;C:\\Windows\\system32' };
+    assert.strictEqual(lib.isDirectoryOnPath('C:\\Users\\x\\.local\\bin', { env, platform: 'win32' }), true);
+    assert.strictEqual(lib.isDirectoryOnPath('c:\\users\\X\\.LOCAL\\BIN', { env, platform: 'win32' }), true, 'Windows is case-insensitive');
+    assert.strictEqual(lib.isDirectoryOnPath('C:\\not\\on\\path', { env, platform: 'win32' }), false);
+    const posix = { PATH: '/home/x/.local/bin:/usr/bin' };
+    assert.strictEqual(lib.isDirectoryOnPath('/home/x/.local/bin', { env: posix, platform: 'linux' }), true);
+    assert.strictEqual(lib.isDirectoryOnPath('/HOME/X/.LOCAL/BIN', { env: posix, platform: 'linux' }), false, 'POSIX stays case-sensitive');
+  });
+
+  await test('resolveBinDir: default on PATH, npm fallback, explicit not-on-PATH, and clear failure', () => {
+    const home = 'C:\\Users\\x';
+    // Default dir IS on PATH.
+    let r = lib.resolveBinDir({ env: { PATH: 'C:\\Users\\x\\.local\\bin' }, platform: 'win32', home });
+    assert.strictEqual(r.onPath, true);
+    assert.strictEqual(r.dir, path.join(home, '.local', 'bin'));
+    // Default NOT on PATH, but the npm global bin dir is -> fallback with a note.
+    r = lib.resolveBinDir({ env: { PATH: 'C:\\Users\\x\\AppData\\Roaming\\npm', APPDATA: 'C:\\Users\\x\\AppData\\Roaming' }, platform: 'win32', home });
+    assert.strictEqual(r.onPath, true);
+    assert.ok(r.note, 'fallback explains itself');
+    // Explicit --bin-dir not on PATH: honored, but flagged.
+    r = lib.resolveBinDir({ env: { PATH: 'C:\\Windows\\system32' }, platform: 'win32', home, explicit: 'D:\\tools' });
+    assert.strictEqual(r.dir, path.resolve('D:\\tools'));
+    assert.strictEqual(r.onPath, false);
+    assert.strictEqual(r.explicit, true);
+    // Nothing on PATH and nothing explicit -> clear failure (never auto-modify PATH).
+    r = lib.resolveBinDir({ env: { PATH: 'C:\\Windows\\system32' }, platform: 'win32', home });
+    assert.strictEqual(r.dir, null);
+    assert.ok(/--bin-dir/.test(r.error), 'failure names the remediation');
+  });
+
+  await test('installMcp dry-run with a shim launch spec still pins the absolute node for the MCP', () => {
+    const home = tmpDir();
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: {} }), 'utf8');
+    const res = installer.installMcp({
+      dryRun: true,
+      home,
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      claudeLaunch: { command: 'C:\\Program Files\\nodejs\\node.exe', prefixArgs: ['C:\\claude\\cli.js'] },
+    });
+    assert.strictEqual(res.action, 'add');
+    assert.ok(res.args.includes('C:\\Program Files\\nodejs\\node.exe'), 'MCP command is the pinned node');
+    assert.ok(!res.args.includes('C:\\claude\\cli.js'), 'the Claude shim cli.js is NOT part of the MCP registration (separate concerns)');
+  });
+
+  await test('a skipped (unmanaged) wrapper makes the installer exit non-zero (partial install)', () => {
+    const binDir = tmpDir();
+    const clash = path.join(binDir, lib.BRIDGE_CMD);
+    fs.writeFileSync(clash, '@echo off\r\necho mine\r\n', 'utf8');
+    const realHomedir = os.homedir;
+    os.homedir = () => tmpDir();
+    try {
+      // Dry run: skipped wrapper detected -> non-zero.
+      let code = installer.main(['--dry-run', '--json', '--bin-dir', binDir, '--no-mcp']);
+      assert.strictEqual(code, 1, 'skipped wrapper must fail the install status');
+      // Real write: same.
+      code = installer.main(['--json', '--bin-dir', binDir, '--no-mcp']);
+      assert.strictEqual(code, 1);
+      assert.strictEqual(fs.readFileSync(clash, 'utf8'), '@echo off\r\necho mine\r\n', 'unmanaged file untouched');
+    } finally {
+      os.homedir = realHomedir;
+    }
+  });
+
+  await test('install-global exits non-zero when the bin dir is not on PATH (dry run, JSON)', () => {
+    const binDir = tmpDir();
+    const realHomedir = os.homedir;
+    const realPrereq = installer.checkPrerequisites;
+    os.homedir = () => tmpDir();
+    // Stub prerequisites so the test does not depend on the REAL machine PATH
+    // (which must keep containing node/claude for everything else to work).
+    installer.checkPrerequisites = () => ({
+      problems: [],
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      claudeLaunch: { command: 'C:\\Program Files\\nodejs\\node.exe', prefixArgs: ['C:\\claude\\cli.js'] },
+    });
+    try {
+      let out = '';
+      const origWrite = process.stdout.write;
+      process.stdout.write = (s) => { out += s; return true; };
+      let code;
+      try {
+        code = installer.main(['--dry-run', '--json', '--bin-dir', binDir, '--no-mcp']);
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      assert.strictEqual(code, 1, 'not-on-PATH bin dir is a partial/failed install');
+      const parsed = JSON.parse(out);
+      assert.strictEqual(parsed.binOnPath, false);
+    } finally {
+      os.homedir = realHomedir;
+      installer.checkPrerequisites = realPrereq;
+    }
+  });
+
+  await test('a clean install into an on-PATH bin dir exits 0 (dry run, JSON)', () => {
+    const binDir = tmpDir();
+    const realHomedir = os.homedir;
+    const realPrereq = installer.checkPrerequisites;
+    const realPath = process.env.PATH;
+    os.homedir = () => tmpDir();
+    installer.checkPrerequisites = () => ({
+      problems: [],
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      claudeLaunch: { command: 'C:\\Program Files\\nodejs\\node.exe', prefixArgs: ['C:\\claude\\cli.js'] },
+    });
+    try {
+      let out = '';
+      const origWrite = process.stdout.write;
+      // The temp bin dir must appear on PATH for THIS process: append it.
+      process.env.PATH = `${binDir}${path.delimiter}${realPath || ''}`;
+      process.stdout.write = (s) => { out += s; return true; };
+      let code;
+      try {
+        code = installer.main(['--dry-run', '--json', '--bin-dir', binDir, '--no-mcp']);
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      assert.strictEqual(code, 0);
+      const parsed = JSON.parse(out);
+      assert.strictEqual(parsed.binOnPath, true);
+      assert.strictEqual(parsed.wrappers.action, 'planned');
+    } finally {
+      os.homedir = realHomedir;
+      installer.checkPrerequisites = realPrereq;
+      process.env.PATH = realPath;
+    }
   });
 
   await test('installMcp plans a rollback of the previous registration when add fails (non-dry-run, stubbed runClaude)', () => {

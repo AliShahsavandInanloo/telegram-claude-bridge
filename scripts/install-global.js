@@ -32,17 +32,19 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const childProcess = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const LAUNCHER = path.join(ROOT, 'scripts', 'launch-channel.js');
 const BRIDGE_ENTRY = path.join(ROOT, 'bridge.js');
 
-const { findExecutableInPath } = require(path.join(ROOT, 'lib', 'config.js'));
+const { findExecutableInPath, resolveClaudeLaunch } = require(path.join(ROOT, 'lib', 'config.js'));
 const {
   MCP_SERVER_NAME,
   WRAPPER_NAMES,
   defaultBinDir,
+  isDirectoryOnPath,
+  resolveBinDir,
   wrapperContents,
   isManaged,
   buildMcpAddArgs,
@@ -64,7 +66,11 @@ function parseArgs(argv) {
     else if (a === '--no-wrappers') opts.noWrappers = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--help' || a === '-h') opts.help = true;
-    else if (a === '--bin-dir') { opts.binDir = argv[i + 1]; i += 1; }
+    else if (a === '--bin-dir') {
+      if (i + 1 >= argv.length) throw new Error('--bin-dir requires a directory argument');
+      opts.binDir = argv[i + 1];
+      i += 1;
+    }
     else if (a.startsWith('--bin-dir=')) opts.binDir = a.slice('--bin-dir='.length);
     else if (a.startsWith('--')) throw new Error(`unknown option: ${a}`);
   }
@@ -76,17 +82,35 @@ const HELP = `install-global — install the telegram-bridge Channel for this us
 Usage: node scripts/install-global.js [options]
 
   --dry-run        show what would change, touch nothing
-  --bin-dir <dir>  directory for the wrapper commands (default ~/.local/bin)
+  --bin-dir <dir>  directory for the wrapper commands (default ~/.local/bin;
+                   the directory must already be on PATH — it is verified,
+                   never assumed, and PATH is never modified automatically)
   --no-mcp         skip the user-scope MCP registration
   --no-wrappers    skip installing the wrapper commands
   --json           print a machine-readable summary
   --help
 `;
 
-function runClaude(args) {
-  const claudeExe = findExecutableInPath('claude', process.platform, process.env, fs) || 'claude';
+/**
+ * Run a `claude` CLI subcommand through the resolved Claude LAUNCH SPEC
+ * { command, prefixArgs } — always shell:false, argv-preserved (paths with
+ * spaces stay single arguments). The spec comes from checkPrerequisites()
+ * (lib/config.js resolveClaudeLaunch), so native claude.exe AND Windows
+ * .cmd/.bat shim installations both work. Tests may stub module.exports.runClaude.
+ */
+function runClaude(args, claudeLaunch = null) {
+  const launch = claudeLaunch || resolveClaudeLaunch('claude', { fsImpl: fs, platform: process.platform, env: process.env });
+  // Accept BOTH shapes: a full resolver result ({ok, command, prefixArgs, error})
+  // and a plain launch spec ({command, prefixArgs}). Only a spec with a usable
+  // command proceeds — a failed/unmodelable resolution never runs.
+  const usable = launch && typeof launch.command === 'string' && launch.command &&
+    Array.isArray(launch.prefixArgs || []) &&
+    (launch.ok !== false);
+  if (!usable) {
+    return { ok: false, stderr: (launch && launch.error) || 'Claude Code CLI could not be resolved safely', status: null };
+  }
   try {
-    const stdout = execFileSync(claudeExe, args, { encoding: 'utf8', shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const stdout = childProcess.execFileSync(launch.command, [...launch.prefixArgs, ...args], { encoding: 'utf8', shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
     return { ok: true, stdout: String(stdout || '') };
   } catch (err) {
     return {
@@ -116,17 +140,26 @@ function readUserMcpEntry(name = MCP_SERVER_NAME, home = os.homedir()) {
 // Steps
 // ---------------------------------------------------------------------------
 
+/**
+ * Verify prerequisites and resolve the two executables the installer needs:
+ *   - nodeExe: absolute node (pinned into the MCP registration)
+ *   - claudeLaunch: the Claude LAUNCH SPEC { command, prefixArgs } used for
+ *     every `claude mcp ...` invocation AND baked into claude-telegram.cmd.
+ *     Resolved by the Bridge's own safe resolver (resolveClaudeLaunch), so a
+ *     Windows .cmd/.bat shim installation is modeled safely or fails with
+ *     its clear error — the installer never guesses.
+ */
 function checkPrerequisites() {
   const problems = [];
   for (const [label, p] of [['launcher', LAUNCHER], ['bridge entry', BRIDGE_ENTRY], ['package.json', path.join(ROOT, 'package.json')]]) {
     if (!fs.existsSync(p)) problems.push(`${label} missing: ${p}`);
   }
-  if (!findExecutableInPath('claude', process.platform, process.env, fs)) {
-    problems.push('`claude` (Claude Code CLI) not found on PATH — install Claude Code first');
-  }
+  const claudeCheck = resolveClaudeLaunch('claude', { fsImpl: fs, platform: process.platform, env: process.env });
+  if (!claudeCheck.ok) problems.push(`Claude Code CLI could not be resolved safely: ${claudeCheck.error}`);
   const nodeExe = findExecutableInPath('node', process.platform, process.env, fs);
   if (!nodeExe) problems.push('`node` not found on PATH');
-  return { problems, nodeExe };
+  const claudeLaunch = claudeCheck.ok ? { command: claudeCheck.command, prefixArgs: claudeCheck.prefixArgs } : null;
+  return { problems, nodeExe, claudeLaunch };
 }
 
 function secretStatus() {
@@ -140,7 +173,7 @@ function secretStatus() {
   }
 }
 
-function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node' }) {
+function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node', claudeLaunch = null }) {
   const before = readUserMcpEntry(MCP_SERVER_NAME, home);
   if (before.present && !isOwnRegistration(before.entry, { launcherPath: LAUNCHER, fsImpl: fs })) {
     return {
@@ -163,18 +196,18 @@ function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node' }) {
 
   // Remove first so re-running never creates a duplicate entry.
   // (Called via module.exports so tests can stub the subprocess runner.)
-  if (before.present) module.exports.runClaude(buildMcpRemoveArgs());
-  const added = module.exports.runClaude(addArgs);
+  if (before.present) module.exports.runClaude(buildMcpRemoveArgs(), claudeLaunch);
+  const added = module.exports.runClaude(addArgs, claudeLaunch);
   if (!added.ok) {
     let rollback = null;
     if (previous) {
-      const restore = module.exports.runClaude(['mcp', 'add', '-s', 'user', MCP_SERVER_NAME, '--', previous.command, ...previous.args]);
+      const restore = module.exports.runClaude(['mcp', 'add', '-s', 'user', MCP_SERVER_NAME, '--', previous.command, ...previous.args], claudeLaunch);
       rollback = restore.ok ? 'previous registration restored' : `ROLLBACK FAILED: previous registration could not be restored (run: claude mcp add -s user ${MCP_SERVER_NAME} -- ${previous.command} ${previous.args.join(' ')})`;
     }
     return { action: 'failed', error: added.stderr || added.stdout || 'claude mcp add failed', rollback };
   }
 
-  const verified = module.exports.runClaude(buildMcpGetArgs());
+  const verified = module.exports.runClaude(buildMcpGetArgs(), claudeLaunch);
   return {
     action: before.present ? 'replaced' : 'added',
     args: addArgs,
@@ -183,9 +216,8 @@ function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node' }) {
   };
 }
 
-function installWrappers({ dryRun, binDir, nodeExe = 'node' }) {
-  const claudeExe = findExecutableInPath('claude', process.platform, process.env, fs) || 'claude';
-  const files = wrapperContents({ root: ROOT, claudeExe, nodeExe: nodeExe || 'node' });
+function installWrappers({ dryRun, binDir, nodeExe = 'node', claudeLaunch = null }) {
+  const files = wrapperContents({ root: ROOT, claudeLaunch, nodeExe: nodeExe || 'node' });
   const written = [];
   const skipped = [];
 
@@ -208,22 +240,23 @@ function installWrappers({ dryRun, binDir, nodeExe = 'node' }) {
     written.push({ name, path: target, status });
   }
 
-  return { binDir, written, skipped, claudeExe };
+  const launch = claudeLaunch || { command: 'claude', prefixArgs: [] };
+  return { binDir, written, skipped, claudeLaunch: launch };
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+function main(argv = process.argv.slice(2)) {
+  const opts = parseArgs(argv);
   if (opts.help) {
     process.stdout.write(HELP);
     return 0;
   }
 
   const log = opts.json ? () => {} : (m) => process.stdout.write(`${m}\n`);
-  const { problems, nodeExe } = checkPrerequisites();
+  const { problems, nodeExe, claudeLaunch } = checkPrerequisites();
   const secret = secretStatus();
 
   if (problems.length) {
@@ -231,22 +264,33 @@ function main() {
     return 1;
   }
 
-  const binDir = opts.binDir ? path.resolve(opts.binDir) : defaultBinDir();
+  // WHERE do the wrappers go? The bin directory is verified against PATH —
+  // never assumed. Default falls back to the npm global bin dir; an explicit
+  // --bin-dir is honored but warned about when it is not on PATH.
+  const bin = resolveBinDir({ env: process.env, platform: process.platform, explicit: opts.binDir });
+  if (bin.error) {
+    process.stderr.write(`error: ${bin.error}\n`);
+    return 1;
+  }
+  const binDir = bin.dir;
 
   log(`telegram-bridge — global install${opts.dryRun ? ' (dry run)' : ''}`);
   log(`  bridge root : ${ROOT}`);
   log(`  launcher    : ${LAUNCHER}`);
   log(`  node        : ${nodeExe}`);
-  log(`  bin dir     : ${binDir}`);
+  log(`  claude      : ${claudeLaunch.command}${claudeLaunch.prefixArgs.length ? ' ' + claudeLaunch.prefixArgs.join(' ') : ''}`);
+  log(`  bin dir     : ${binDir}${bin.onPath ? '' : '  (WARNING: not on PATH — commands will not resolve globally)'}`);
+  if (bin.note) log(`  note        : ${bin.note}`);
   log(`  secret      : ${secret.path} (${secret.present ? `ok, ${secret.length} chars` : 'NOT FOUND'})`);
   log('');
 
-  const result = { root: ROOT, launcher: LAUNCHER, binDir, dryRun: opts.dryRun, secret: { path: secret.path, present: secret.present, length: secret.length } };
+  const result = { root: ROOT, launcher: LAUNCHER, binDir, binOnPath: bin.onPath, dryRun: opts.dryRun, secret: { path: secret.path, present: secret.present, length: secret.length } };
+  let exitCode = 0;
 
   if (opts.noMcp) {
     result.mcp = { action: 'skipped' };
   } else {
-    result.mcp = installMcp({ dryRun: opts.dryRun, nodeExe });
+    result.mcp = installMcp({ dryRun: opts.dryRun, nodeExe, claudeLaunch });
     const r = result.mcp;
     if (r.action === 'refused' || r.action === 'failed') {
       log(`  MCP: ${r.action} — ${r.reason || r.error}`);
@@ -254,14 +298,32 @@ function main() {
       return 1;
     }
     log(`  MCP: ${r.action} user-scope server "${MCP_SERVER_NAME}"${r.dryRun ? '' : r.verified ? ' (verified)' : ' (WARNING: not verified)'}`);
+    // Registration succeeded but verification failed: report it honestly.
+    if (!r.dryRun && r.verified === false) exitCode = 1;
   }
 
   if (opts.noWrappers) {
     result.wrappers = { action: 'skipped' };
   } else {
-    result.wrappers = installWrappers({ dryRun: opts.dryRun, binDir, nodeExe });
+    result.wrappers = installWrappers({ dryRun: opts.dryRun, binDir, nodeExe, claudeLaunch });
     for (const w of result.wrappers.written) log(`  wrapper: ${w.status} ${w.path}`);
-    for (const s of result.wrappers.skipped) log(`  wrapper: SKIPPED ${s.name} — ${s.reason}`);
+    for (const s of result.wrappers.skipped) {
+      log(`  wrapper: SKIPPED ${s.name} — ${s.reason}`);
+      log(`           remediation: remove or rename the existing file, then re-run, or choose another --bin-dir`);
+    }
+    // A skipped (unmanaged) wrapper means the requested installation did NOT
+    // complete: report partial, never a clean success. Explicit bin dir not
+    // on PATH is also only a partial success.
+    if (result.wrappers.skipped.length > 0) {
+      result.wrappers.action = 'partial';
+      exitCode = 1;
+    } else {
+      result.wrappers.action = opts.dryRun ? 'planned' : 'installed';
+    }
+  }
+  if (!bin.onPath && exitCode === 0) {
+    log(`  WARNING: ${binDir} is not on PATH — telegram-claude-bridge / claude-telegram will not resolve globally.`);
+    exitCode = 1;
   }
 
   log('');
@@ -276,13 +338,13 @@ function main() {
   }
 
   if (opts.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  return 0;
+  return exitCode;
 }
 
 // Exports are assigned BEFORE the main invocation: installMcp routes its
 // subprocess calls through module.exports.runClaude so tests can stub the
 // runner, which only works if the exports object exists while main() runs.
-module.exports = { parseArgs, readUserMcpEntry, checkPrerequisites, secretStatus, installMcp, installWrappers, runClaude };
+module.exports = { parseArgs, readUserMcpEntry, checkPrerequisites, secretStatus, installMcp, installWrappers, runClaude, main };
 
 if (require.main === module) {
   try {

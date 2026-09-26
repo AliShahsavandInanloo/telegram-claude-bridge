@@ -91,6 +91,18 @@ occupied, identify the process using it. Do NOT kill that process
 automatically — tell the user what owns the port and offer these choices:
 stop the conflicting application, or configure another `CLAUDE_CHANNEL_PORT`.
 
+**WRAPPER BIN DIRECTORY**
+
+The installer verifies that the wrapper directory is on PATH instead of
+assuming it. If it reports the chosen bin directory is not on PATH (or exits
+non-zero with that warning), identify a safe user-writable directory that IS
+already on PATH (for example `%APPDATA%\npm`) and re-run:
+
+    npm run install-global -- --bin-dir "<user-writable directory already on PATH>"
+
+Never modify the user's PATH automatically without explicit user approval, and
+never write wrappers into system or administrator-only directories.
+
 **GLOBAL INSTALLATION**
 
 Use the repository's existing supported installer:

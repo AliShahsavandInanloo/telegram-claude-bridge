@@ -73,15 +73,75 @@ function samePath(a, b, platform = process.platform) {
 }
 
 /**
- * Directory that receives the wrapper commands. Defaults to `~/.local/bin`,
- * which is already on this user's PATH and needs no Administrator rights.
+ * Directory that receives the wrapper commands. Defaults to `~/.local/bin`;
+ * whether that directory is actually on the user's PATH is NOT assumed —
+ * resolveBinDir() verifies it and falls back / fails clearly when it is not.
  * Overridable with --bin-dir or BRIDGE_BIN_DIR.
  */
 function defaultBinDir({ env = process.env, platform = process.platform, home = os.homedir() } = {}) {
   const override = String(env.BRIDGE_BIN_DIR || '').trim();
   if (override) return path.resolve(override);
-  if (platform === 'win32') return path.join(home, '.local', 'bin');
   return path.join(home, '.local', 'bin');
+}
+
+/**
+ * True when `dir` resolves to a directory listed in the user's PATH.
+ * Windows comparison is case-insensitive (NTFS); other platforms case-sensitive.
+ */
+function isDirectoryOnPath(dir, { env = process.env, platform = process.platform } = {}) {
+  const d = String(dir || '').trim();
+  if (!d) return false;
+  let resolved;
+  try {
+    resolved = path.resolve(d);
+  } catch {
+    return false;
+  }
+  const cmp = (p) => (platform === 'win32' ? String(p).toLowerCase() : String(p));
+  const target = cmp(resolved);
+  // Split on the TARGET platform's delimiter (not the host's) so the helper
+  // behaves correctly in cross-platform tests and when inspecting a PATH
+  // captured on another OS.
+  const delim = platform === 'win32' ? ';' : ':';
+  const entries = String(env.PATH || env.Path || '').split(delim).filter(Boolean);
+  return entries.some((e) => {
+    try {
+      return cmp(path.resolve(e)) === target;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Decide WHERE the wrapper commands go and whether that directory is on PATH.
+ *
+ *   - explicit (--bin-dir / BRIDGE_BIN_DIR): always used; onPath is reported
+ *     so the caller can warn that commands will not resolve globally.
+ *   - default: `~/.local/bin` when it IS on PATH; otherwise the npm global
+ *     bin directory (`%APPDATA%\npm`) when that is on PATH; otherwise the
+ *     install FAILS with clear remediation — the user's PATH is never
+ *     modified automatically and wrappers are never written into a
+ *     system/administrator directory just because it happens to be on PATH.
+ */
+function resolveBinDir({ env = process.env, platform = process.platform, home = os.homedir(), explicit = null } = {}) {
+  const override = explicit != null ? String(explicit).trim() : String(env.BRIDGE_BIN_DIR || '').trim();
+  if (override) {
+    const dir = path.resolve(override);
+    return { dir, onPath: isDirectoryOnPath(dir, { env, platform }), explicit: true };
+  }
+  const primary = path.join(home, '.local', 'bin');
+  if (isDirectoryOnPath(primary, { env, platform })) return { dir: primary, onPath: true, explicit: false };
+  const npmBin = env.APPDATA ? path.join(env.APPDATA, 'npm') : null;
+  if (npmBin && isDirectoryOnPath(npmBin, { env, platform })) {
+    return { dir: npmBin, onPath: true, explicit: false, note: `~/.local/bin is not on PATH; using the npm global bin directory ${npmBin}` };
+  }
+  return {
+    dir: null,
+    onPath: false,
+    explicit: false,
+    error: `no suitable bin directory found: ${primary} is not on PATH and no npm global bin directory is either. Re-run with an explicit directory that is already on PATH: npm run install-global -- --bin-dir "<user-writable directory on PATH>"`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -105,13 +165,34 @@ function renderCmd({ lines }) {
  * Neither file contains a secret: the Claude wrapper names the MCP server, and
  * the Bridge wrapper only starts the Bridge, which loads its own .env.
  */
-function wrapperContents({ root, claudeExe = 'claude', nodeExe = 'node' }) {
+/**
+ * Quote a path for a .cmd wrapper (double quotes; no shell interpolation is
+ * ever performed by the installer itself — the wrapper is a static file).
+ */
+function quoteCmd(p) {
+  return `"${String(p)}"`;
+}
+
+/**
+ * The claude-telegram invocation line from a Claude LAUNCH SPEC
+ * { command, prefixArgs } — the same concept lib/config.js resolves for the
+ * Bridge. Native exe: "claude.exe" flag %*. npm-style shim: "node.exe"
+ * "claude-cli.js" flag %*. Every element is quoted so spaces survive.
+ */
+function claudeInvocation(launch, channelFlag) {
+  const parts = [quoteCmd(launch.command), ...launch.prefixArgs.map(quoteCmd), channelFlag, '%*'];
+  return parts.join(' ');
+}
+
+function wrapperContents({ root, claudeExe = 'claude', claudeLaunch = null, nodeExe = 'node' }) {
+  // Launch spec wins; a bare claudeExe is treated as a native command.
+  const launch = claudeLaunch || { command: claudeExe, prefixArgs: [] };
   const claudeTelegram = renderCmd({
     lines: [
       'REM Launch Claude Code in the CURRENT directory with the telegram-bridge Channel.',
       'REM The Channel comes from the user-scope MCP server "telegram-bridge";',
       'REM no project needs its own .mcp.json.',
-      `"${claudeExe}" --dangerously-load-development-channels server:${MCP_SERVER_NAME} %*`,
+      claudeInvocation(launch, `--dangerously-load-development-channels server:${MCP_SERVER_NAME}`),
     ],
   });
 
@@ -187,6 +268,8 @@ module.exports = {
   BRIDGE_CMD,
   WRAPPER_NAMES,
   defaultBinDir,
+  isDirectoryOnPath,
+  resolveBinDir,
   renderCmd,
   wrapperContents,
   isManaged,
@@ -195,4 +278,6 @@ module.exports = {
   buildMcpGetArgs,
   isOwnRegistration,
   samePath,
+  quoteCmd,
+  claudeInvocation,
 };

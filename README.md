@@ -111,10 +111,18 @@ MCP configuration, never committed, never on a command line, and never printed.
 ```cmd
 npm run install-global          # idempotent — replaces its own entry, never duplicates
 npm run uninstall-global        # removes only what it created
+npm run uninstall-global -- --force   # also remove a foreign "telegram-bridge" MCP registration
 ```
 
-Both are safe to re-run; uninstall never touches `.env`, `state/`,
-`node_modules/`, your other MCP servers, or hand-written files. Full details in
+Both are safe to re-run. The wrapper directory is **verified against PATH** —
+never assumed: if `~/.local/bin` is not on PATH the installer falls back to the
+npm global bin directory, or fails with clear remediation instead of silently
+writing commands you could never run. A non-zero exit means the installation
+or uninstall did **not** complete (skipped wrappers, failed MCP operation,
+off-PATH bin dir) — automation and AI agents should treat it as such. Uninstall
+never touches `.env`, `state/`, `node_modules/`, your other MCP servers, or
+hand-written files; `--force` applies to the MCP registration only, never to
+wrapper files. Full details in
 [DOCUMENTATION.md §Global installation](DOCUMENTATION.md#global-installation).
 
 ## Install with an AI coding agent (optional)
