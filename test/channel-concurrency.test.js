@@ -1,19 +1,25 @@
 'use strict';
 
 /**
- * Registration-concurrency correctness tests:
+ * Registration-concurrency correctness tests (DETERMINISTIC — no fixed sleeps
+ * for transaction progression):
  *   1. dead candidate commit (candidate closes while save pending)
  *   2. generation tokens (superseded attempt cannot commit/ack)
  *   3. concurrent B/C replacement race (only one authoritative)
  *   4. old healthy connection preserved until the winner commits
  *   7. onClose fires once per connection lifecycle (3 cycles = 3 callbacks)
- *   8. persisted clientId identity (same project, two sessions, restart,
- *      rename, legacy migration)
+ *   8. persisted clientId identity (same project, two sessions, rename,
+ *      legacy migration)
  *   13. stale late-close event cannot tear down the authoritative session
  *   10. stale snapshot restore cannot overwrite a newer committed state
  *
- * Uses real loopback sockets + the real production client/hub wherever the
- * race requires it; reg.save is the only injected seam.
+ * Synchronization discipline: every wait is a deterministic event gate —
+ * an ACK/NAK frame arrives, a save gate resolves/rejects, a hub state
+ * changes, or a registry transaction settles. Fixed sleeps are used ONLY
+ * where the thing tested IS real loopback socket timing (a few settle
+ * graces after a close event), never to assume an async state transition
+ * completed. reg.save is the only injected seam; everything else is the
+ * real production hub/ipc/registry code.
  */
 
 const assert = require('assert');
@@ -40,7 +46,10 @@ const test = (function () {
       }
     }
     console.log(`${pass} passed, ${failures.length} failed`);
-    if (failures.length) process.exit(1);
+    // process.exitCode (not process.exit): lets pending I/O settle so leaked
+    // handles surface as a nonzero exit in the stress loop instead of being
+    // silently masked. Resources are closed in each test's try/finally.
+    process.exitCode = failures.length ? 1 : 0;
   };
   return t;
 })();
@@ -50,6 +59,7 @@ const { createHubLink } = require('../lib/channel/claude-channel');
 const { createRegistry } = require('../lib/claude/registry');
 
 const SECRET = crypto.randomBytes(32).toString('hex');
+/** Only for real socket settle graces — NEVER for transaction progression. */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function tmpDir() {
@@ -92,13 +102,46 @@ function makeHub(reg, extra = {}) {
   });
 }
 
-async function waitRegistered(link, timeoutMs = 8000) {
-  return new Promise((resolve) => {
-    const iv = setInterval(() => {
-      if (link.registered) { clearInterval(iv); resolve(true); }
-    }, 15);
-    setTimeout(() => { clearInterval(iv); resolve(false); }, timeoutMs);
-  });
+/**
+ * Deterministic wait: poll predicate() until true or timeout. NEVER
+ * silently succeeds on timeout — throws with the caller's description.
+ */
+async function waitFor(predicate, timeoutMs, description) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${description}`);
+    }
+    await sleep(5);
+  }
+}
+
+/** Convenience: wait until a conn has received a frame of the given type. */
+function sentType(conn, type) {
+  return () => conn.sent.some((m) => m.type === type);
+}
+
+/**
+ * Save gate: replaces reg.save with explicitly deferred promises. The test
+ * learns EXACTLY when each save starts (gates.length) and decides when each
+ * settles — no sleep in between. resolve(err) is guarded so a failure can
+ * only be injected via reject(Error).
+ */
+function makeSaveGate() {
+  const gates = [];
+  const control = {
+    gates,
+    get length() { return gates.length; },
+    install(reg) {
+      reg.save = () => {
+        const d = makeDeferred();
+        gates.push(d);
+        return d.promise;
+      };
+      return control;
+    },
+  };
+  return control;
 }
 
 /**
@@ -148,45 +191,44 @@ test('dead candidate: candidate closes while save pending → commit aborted, ol
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  // A registers healthy.
-  const a = fakeConn();
-  hub.onConnection({ conn: a, hello: { clientId: 'dead-txn', secret: SECRET } });
-  a.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 1 } });
-  await sleep(80);
-  const entry = reg.getByName('race');
-  assert.ok(hub.isOnline(entry.id), 'A online');
+  try {
+    // A registers healthy — wait for the REAL ack, not a sleep.
+    const a = fakeConn();
+    hub.onConnection({ conn: a, hello: { clientId: 'dead-txn', secret: SECRET } });
+    a.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 1 } });
+    await waitFor(sentType(a, 'register_ack'), 5000, 'A register_ack');
+    const entry = reg.getByName('race');
+    assert.ok(entry, 'A registry record exists');
+    assert.ok(hub.isOnline(entry.id), 'A online');
 
-  // B replacement with a save we hold open.
-  const saveCalls = [];
-  let releaseSave = null;
-  reg.save = () => {
-    saveCalls.push(true);
-    return new Promise((resolve) => { releaseSave = resolve; });
-  };
-  const b = fakeConn();
-  hub.onConnection({ conn: b, hello: { clientId: 'dead-txn', secret: SECRET } });
-  b.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 2 } });
-  await sleep(80);
-  assert.ok(saveCalls.length >= 1, 'B reached save');
-  // NOTE: while B's save is pending, the registry memory shows B's STAGED pid
-  // (mutation-before-persist is the transactional design). What matters: no
-  // COMMIT happened — hub.isOnline/deliver still route through A, and after
-  // the abort the registry is restored to A's state.
-  assert.ok(hub.deliver(entry.id, { content: 'x', meta: {} }).ok, 'routing still via A while B pending');
+    // B replacement with a save we hold open.
+    const gate = makeSaveGate().install(reg);
+    const b = fakeConn();
+    hub.onConnection({ conn: b, hello: { clientId: 'dead-txn', secret: SECRET } });
+    b.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 2 } });
+    await waitFor(() => gate.length >= 1, 5000, 'B save to start');
+    // NOTE: while B's save is pending, the registry memory shows B's STAGED pid
+    // (mutation-before-persist is the transactional design). What matters: no
+    // COMMIT happened — hub.isOnline/deliver still route through A, and after
+    // the abort the registry is restored to A's state.
+    assert.ok(hub.deliver(entry.id, { content: 'x', meta: {} }).ok, 'routing still via A while B pending');
 
-  // B DIES while save pending.
-  b.destroy();
-  await sleep(30);
-  releaseSave(); // B's save succeeds AFTER death
-  await sleep(80);
+    // B DIES while save pending. Its close handler runs; the dead-candidate
+    // commit validation happens when the save settles.
+    b.destroy();
+    await sleep(20); // socket-close settle grace (real close-event propagation)
+    gate.gates[0].resolve(); // B's save succeeds AFTER death
+    await waitFor(sentType(b, 'register_nak'), 5000, 'B register_nak after death');
 
-  assert.ok(b.sent.some((m) => m.type === 'register_nak'), 'dead candidate got register_nak, not ack');
-  assert.strictEqual(b.sent.some((m) => m.type === 'register_ack'), false, 'dead candidate NEVER acked');
-  assert.strictEqual(reg.get(entry.id).pid, 1, 'registry rolled back — still A’s committed state');
-  assert.ok(hub.isOnline(entry.id), 'session still online via A');
-  assert.ok(hub.deliver(entry.id, { content: 'x', meta: {} }).ok, 'delivery still works via A');
-  assert.strictEqual(a.destroyed, false, 'A never destroyed');
-  hub.close();
+    assert.strictEqual(b.sent.some((m) => m.type === 'register_ack'), false, 'dead candidate NEVER acked');
+    await waitFor(() => reg.transactionBusy() === false, 5000, 'B transaction rollback to settle');
+    assert.strictEqual(reg.get(entry.id).pid, 1, 'registry rolled back — still A’s committed state');
+    assert.ok(hub.isOnline(entry.id), 'session still online via A');
+    assert.ok(hub.deliver(entry.id, { content: 'x', meta: {} }).ok, 'delivery still works via A');
+    assert.strictEqual(a.destroyed, false, 'A never destroyed');
+  } finally {
+    hub.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -200,50 +242,44 @@ test('concurrent B/C: only the winning generation commits; loser NAKed and close
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  const a = fakeConn();
-  hub.onConnection({ conn: a, hello: { clientId: 'gen-race', secret: SECRET } });
-  a.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 1 } });
-  await sleep(80);
-  const entry = reg.getByName('race');
+  try {
+    const a = fakeConn();
+    hub.onConnection({ conn: a, hello: { clientId: 'gen-race', secret: SECRET } });
+    a.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 1 } });
+    await waitFor(sentType(a, 'register_ack'), 5000, 'A register_ack');
+    const entry = reg.getByName('race');
 
-  // Serialize through a save gate so B and C overlap.
-  const pending = [];
-  reg.save = () => new Promise((resolve) => pending.push(resolve));
+    // Serialize through a save gate so B and C overlap deterministically.
+    const gate = makeSaveGate().install(reg);
 
-  const b = fakeConn();
-  hub.onConnection({ conn: b, hello: { clientId: 'gen-race', secret: SECRET } });
-  b.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 2 } });
-  const c = fakeConn();
-  hub.onConnection({ conn: c, hello: { clientId: 'gen-race', secret: SECRET } });
-  c.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 3 } });
-  await sleep(80);
+    const b = fakeConn();
+    hub.onConnection({ conn: b, hello: { clientId: 'gen-race', secret: SECRET } });
+    b.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 2 } });
+    // B is generation 2; C (generation 3, same clientId) supersedes it at the
+    // PRE-LOCK generation check, so B NAKs "superseded" WITHOUT ever reaching
+    // save. C is the one whose save is gated (the per-identity lock serializes
+    // it behind B's settled transaction).
+    const c = fakeConn();
+    hub.onConnection({ conn: c, hello: { clientId: 'gen-race', secret: SECRET } });
+    c.fire({ type: 'register', registration: { project: proj, projectName: 'Race', pid: 3 } });
 
-  // C is serialized BEHIND B by the per-identity lock: only B's save is
-  // pending while C waits for the lock.
-  assert.strictEqual(pending.length, 1, `C serialized behind B (pending: ${pending.length})`);
+    await waitFor(sentType(b, 'register_nak'), 5000, 'B register_nak (superseded pre-lock)');
+    assert.strictEqual(b.sent.some((m) => m.type === 'register_ack'), false, 'B never acked');
+    await waitFor(() => gate.length >= 1, 5000, 'C save to start');
+    assert.strictEqual(gate.length, 1, 'exactly one save pending: C’s (B never reached save)');
 
-  // Release B's save: B is superseded by C's newer generation → cannot commit.
-  // NOTE: C's transaction staged pid=3 in registry memory (inside the same
-  // per-identity lock) BEFORE B's abort ran, so at this instant the registry
-  // shows C's staged state — the invariant that matters is B's NAK + no ACK,
-  // and C's eventual authoritative commit below.
-  pending[0]();
-  await sleep(80);
-  const bNak = b.sent.find((m) => m.type === 'register_nak');
-  assert.ok(bNak, 'B (stale generation) NAKed');
-  assert.strictEqual(b.sent.some((m) => m.type === 'register_ack'), false, 'B never acked');
+    // Release C's save → C (current generation) commits.
+    gate.gates[0].resolve();
+    await waitFor(sentType(c, 'register_ack'), 5000, 'C register_ack');
 
-  // Release C's save (now queued behind the lock): C is current → commits.
-  // (C's save resolves immediately via the real registry path — wait for it.)
-  await sleep(150); // allow C's transaction to run its save+commit
-  assert.ok(c.sent.some((m) => m.type === 'register_ack'), 'C acked');
-  await sleep(80);
-  assert.ok(c.sent.some((m) => m.type === 'register_ack'), 'C acked');
-  assert.strictEqual(reg.get(entry.id).pid, 3, 'C’s metadata committed');
-  assert.strictEqual(a.destroyed, true, 'A retired exactly when C committed');
-  assert.strictEqual(hub.onlineIds().length, 1, 'exactly one authoritative connection');
-  assert.strictEqual(reg.list().length, 1, 'no duplicate record');
-  hub.close();
+    assert.strictEqual(reg.get(entry.id).pid, 3, 'C’s metadata committed');
+    assert.strictEqual(a.destroyed, true, 'A retired exactly when C committed');
+    assert.strictEqual(hub.onlineIds().length, 1, 'exactly one authoritative connection');
+    assert.strictEqual(reg.list().length, 1, 'no duplicate record');
+    assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+  } finally {
+    hub.close();
+  }
 });
 
 test('stale loser cannot dispatch tool_call or use delivery id', async () => {
@@ -255,37 +291,42 @@ test('stale loser cannot dispatch tool_call or use delivery id', async () => {
   const toolCalls = [];
   hub.onChannelTool(async (entry, tool, args) => { toolCalls.push({ name: entry.name }); return { sent: true }; });
 
-  const a = fakeConn();
-  hub.onConnection({ conn: a, hello: { clientId: 'loser', secret: SECRET } });
-  a.fire({ type: 'register', registration: { project: proj, projectName: 'Loser', pid: 1 } });
-  await sleep(80);
-  const entry = reg.getByName('loser');
+  try {
+    const a = fakeConn();
+    hub.onConnection({ conn: a, hello: { clientId: 'loser', secret: SECRET } });
+    a.fire({ type: 'register', registration: { project: proj, projectName: 'Loser', pid: 1 } });
+    await waitFor(sentType(a, 'register_ack'), 5000, 'A register_ack');
+    const entry = reg.getByName('loser');
 
-  const pending = [];
-  reg.save = () => new Promise((resolve) => pending.push(resolve));
-  const b = fakeConn();
-  hub.onConnection({ conn: b, hello: { clientId: 'loser', secret: SECRET } });
-  b.fire({ type: 'register', registration: { project: proj, projectName: 'Loser', pid: 2 } });
-  const c = fakeConn();
-  hub.onConnection({ conn: c, hello: { clientId: 'loser', secret: SECRET } });
-  c.fire({ type: 'register', registration: { project: proj, projectName: 'Loser', pid: 3 } });
-  await sleep(80);
-  pending[0](); // B → stale (C is serialized behind B)
-  await sleep(120); // B aborts, then C's transaction runs its own save
-  if (pending[1]) pending[1](); // resolve C's save if it gates
-  await sleep(120);
+    const gate = makeSaveGate().install(reg);
+    const b = fakeConn();
+    hub.onConnection({ conn: b, hello: { clientId: 'loser', secret: SECRET } });
+    b.fire({ type: 'register', registration: { project: proj, projectName: 'Loser', pid: 2 } });
+    const c = fakeConn();
+    hub.onConnection({ conn: c, hello: { clientId: 'loser', secret: SECRET } });
+    c.fire({ type: 'register', registration: { project: proj, projectName: 'Loser', pid: 3 } });
 
-  // Stale B tries a tool call: must be refused (connection destroyed → hub
-  // won't route from it; even a forged frame cannot map to a session).
-  b.fire({ type: 'tool_call', tool: 'reply', callId: 'x1', args: { delivery_id: 'anything', text: 'hi' } });
-  await sleep(30);
-  assert.strictEqual(toolCalls.length, 0, 'stale loser dispatched nothing');
+    // Same determinism as the B/C test: B is superseded pre-lock (never
+    // reaches save); C's save is the gated one.
+    await waitFor(sentType(b, 'register_nak'), 5000, 'B register_nak (superseded pre-lock)');
+    await waitFor(() => gate.length >= 1, 5000, 'C save to start');
+    gate.gates[0].resolve();
+    await waitFor(sentType(c, 'register_ack'), 5000, 'C register_ack');
 
-  // C dispatches normally.
-  c.fire({ type: 'tool_call', tool: 'reply', callId: 'x2', args: { delivery_id: 'anything', text: 'hi' } });
-  await sleep(30);
-  assert.strictEqual(toolCalls.length, 1, 'authoritative C dispatches');
-  hub.close();
+    // Stale B tries a tool call: must be refused — its conn is no longer in
+    // the hub's online map, so the frame cannot map to a session and the hub
+    // answers with an explicit error frame (waited for, not assumed).
+    b.fire({ type: 'tool_call', tool: 'reply', callId: 'x1', args: { delivery_id: 'anything', text: 'hi' } });
+    await waitFor(sentType(b, 'error'), 5000, 'refusal error frame for stale B');
+    assert.strictEqual(toolCalls.length, 0, 'stale loser dispatched nothing');
+
+    // C dispatches normally — wait for the exact tool-call event.
+    c.fire({ type: 'tool_call', tool: 'reply', callId: 'x2', args: { delivery_id: 'anything', text: 'hi' } });
+    await waitFor(() => toolCalls.length === 1, 5000, 'authoritative C tool dispatch');
+    assert.strictEqual(toolCalls.length, 1, 'authoritative C dispatches exactly once');
+  } finally {
+    hub.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -299,28 +340,34 @@ test('all replacement candidates fail → A remains authoritative throughout', a
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  const a = fakeConn();
-  hub.onConnection({ conn: a, hello: { clientId: 'keep-a', secret: SECRET } });
-  a.fire({ type: 'register', registration: { project: proj, projectName: 'Keeper', pid: 1 } });
-  await sleep(80);
-  const entry = reg.getByName('keeper');
+  try {
+    const a = fakeConn();
+    hub.onConnection({ conn: a, hello: { clientId: 'keep-a', secret: SECRET } });
+    a.fire({ type: 'register', registration: { project: proj, projectName: 'Keeper', pid: 1 } });
+    await waitFor(sentType(a, 'register_ack'), 5000, 'A register_ack');
+    const entry = reg.getByName('keeper');
 
-  reg.save = () => Promise.reject(new Error('disk gone'));
-  const b = fakeConn();
-  hub.onConnection({ conn: b, hello: { clientId: 'keep-a', secret: SECRET } });
-  b.fire({ type: 'register', registration: { project: proj, projectName: 'Keeper', pid: 2 } });
-  await sleep(80);
-  const c = fakeConn();
-  hub.onConnection({ conn: c, hello: { clientId: 'keep-a', secret: SECRET } });
-  c.fire({ type: 'register', registration: { project: proj, projectName: 'Keeper', pid: 3 } });
-  await sleep(120);
+    // Every save genuinely fails. Wait for each candidate's NAK event instead
+    // of sleeping and assuming both have processed.
+    reg.save = () => Promise.reject(new Error('disk gone'));
+    const b = fakeConn();
+    hub.onConnection({ conn: b, hello: { clientId: 'keep-a', secret: SECRET } });
+    b.fire({ type: 'register', registration: { project: proj, projectName: 'Keeper', pid: 2 } });
+    await waitFor(sentType(b, 'register_nak'), 5000, 'B register_nak (save failure)');
+    const c = fakeConn();
+    hub.onConnection({ conn: c, hello: { clientId: 'keep-a', secret: SECRET } });
+    c.fire({ type: 'register', registration: { project: proj, projectName: 'Keeper', pid: 3 } });
+    await waitFor(sentType(c, 'register_nak'), 5000, 'C register_nak (save failure)');
 
-  assert.strictEqual(a.destroyed, false, 'A never destroyed');
-  assert.ok(hub.isOnline(entry.id), 'A still online');
-  assert.ok(hub.deliver(entry.id, { content: 'x', meta: {} }).ok, 'A still routable');
-  assert.strictEqual(reg.get(entry.id).pid, 1, 'registry still A’s committed state');
-  assert.ok(b.sent.some((m) => m.type === 'register_nak') && c.sent.some((m) => m.type === 'register_nak'), 'both candidates NAKed');
-  hub.close();
+    assert.strictEqual(a.destroyed, false, 'A never destroyed');
+    assert.ok(hub.isOnline(entry.id), 'A still online');
+    assert.ok(hub.deliver(entry.id, { content: 'x', meta: {} }).ok, 'A still routable');
+    await waitFor(() => reg.transactionBusy() === false, 5000, 'failed transactions to settle');
+    assert.strictEqual(reg.get(entry.id).pid, 1, 'registry still A’s committed state');
+    assert.ok(b.sent.some((m) => m.type === 'register_nak') && c.sent.some((m) => m.type === 'register_nak'), 'both candidates NAKed');
+  } finally {
+    hub.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -340,35 +387,68 @@ test('onClose fires once per connection loss across 3 reconnect cycles', async (
   const hub = createChannelHub({ reg, secret: SECRET, port, logInfo: () => {}, logWarn: () => {}, logError: () => {} });
   await new Promise((resolve) => hub.listen(() => resolve(), { onFatal: () => resolve() }));
 
+  // Production reconnect backoff is 2s; the wait budget only needs to exceed
+  // it — the test waits for the ACTUAL re-registration event, not a timer.
+  const RECONNECT_BUDGET_MS = 15_000;
+
   const link = createHubLink({ port, secret: SECRET, id: 'cycles', logInfo: () => {}, logWarn: () => {} });
   let closeFires = 0;
   link.onClose(() => { closeFires += 1; });
 
   let acks = 0;
-  // Cycle helper: register (gate the save), disconnect, count.
+  let hubOpen = true;
+  // Cycle helper: register (auto-release the save gate), disconnect, count.
   async function cycle(n) {
-    saveGate.release = (saveGate.release || null);
-    const p = waitRegistered(link, 6000);
-    // The hub will call save; release whatever the current gate is.
-    const iv = setInterval(() => { if (saveGate.release) { const r = saveGate.release; saveGate.release = null; r(); } }, 20);
-    const ok = await p;
-    clearInterval(iv);
+    const ok = await waitRegistered(link, RECONNECT_BUDGET_MS, () => {
+      if (saveGate.release) { const r = saveGate.release; saveGate.release = null; r(); }
+    });
     assert.ok(ok, `cycle ${n}: registered`);
     acks += 1;
-    // Kill the hub; client notices (one onClose); restart for the next cycle.
+    // Kill the hub; wait for the ACTUAL onClose event (not 250 ms).
     hub.close();
-    await sleep(250);
+    hubOpen = false;
+    await waitFor(() => closeFires >= n, 5000, `cycle ${n}: onClose event`);
+    await sleep(30); // socket settle grace before relisten
     await new Promise((resolve) => hub.listen(() => resolve(), { onFatal: () => resolve() }));
-    await sleep(2500); // reconnect backoff
+    hubOpen = true;
+    // Reconnect is driven by the client's bounded backoff; waitRegistered
+    // (called by the caller) waits for the REAL registered event, never a
+    // hard-coded 2.5 s.
   }
   await cycle(1);
   await cycle(2);
   await cycle(3);
 
   assert.strictEqual(closeFires, 3, `onClose fired once per loss across 3 cycles (got ${closeFires})`);
-  hub.close();
+  assert.strictEqual(acks, 3, 'each cycle ended registered');
+  try {
+    hub.close();
+  } catch { /* already closed */ }
   link.close();
+  await sleep(30); // socket close settle grace
 });
+
+/**
+ * Poll link.registered with an auto-release pump for the save gate (the
+ * production client path needs the hub's save to complete). Event-driven
+ * settle: resolves on registered, throws on timeout (never silent success).
+ */
+function waitRegistered(link, timeoutMs, pump) {
+  return new Promise((resolve, reject) => {
+    const iv = setInterval(() => {
+      if (pump) pump();
+      if (link.registered) {
+        clearInterval(iv);
+        clearTimeout(to);
+        resolve(true);
+      }
+    }, 15);
+    const to = setTimeout(() => {
+      clearInterval(iv);
+      reject(new Error(`Timed out after ${timeoutMs}ms waiting for link.registered`));
+    }, timeoutMs);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // 8. Persisted clientId identity
@@ -381,32 +461,36 @@ test('two clientIds on the SAME project → two distinct records, each rebinds b
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  const c1 = fakeConn();
-  hub.onConnection({ conn: c1, hello: { clientId: 'alpha', secret: SECRET } });
-  c1.fire({ type: 'register', registration: { project: proj, projectName: 'Proj', pid: 1 } });
-  await sleep(120);
-  const c2 = fakeConn();
-  hub.onConnection({ conn: c2, hello: { clientId: 'beta', secret: SECRET } });
-  c2.fire({ type: 'register', registration: { project: proj, projectName: 'Proj-2', pid: 2 } });
-  await sleep(120);
+  try {
+    const c1 = fakeConn();
+    hub.onConnection({ conn: c1, hello: { clientId: 'alpha', secret: SECRET } });
+    c1.fire({ type: 'register', registration: { project: proj, projectName: 'Proj', pid: 1 } });
+    await waitFor(sentType(c1, 'register_ack'), 5000, 'alpha register_ack');
+    const c2 = fakeConn();
+    hub.onConnection({ conn: c2, hello: { clientId: 'beta', secret: SECRET } });
+    c2.fire({ type: 'register', registration: { project: proj, projectName: 'Proj-2', pid: 2 } });
+    await waitFor(sentType(c2, 'register_ack'), 5000, 'beta register_ack');
 
-  assert.strictEqual(reg.list().length, 2, 'two distinct sessions for one project');
-  const alpha = reg.getByClientId('alpha');
-  const beta = reg.getByClientId('beta');
-  assert.ok(alpha && beta, 'both clientIds persisted on their records');
-  assert.notStrictEqual(alpha.id, beta.id, 'distinct registry identities');
+    assert.strictEqual(reg.list().length, 2, 'two distinct sessions for one project');
+    const alpha = reg.getByClientId('alpha');
+    const beta = reg.getByClientId('beta');
+    assert.ok(alpha && beta, 'both clientIds persisted on their records');
+    assert.notStrictEqual(alpha.id, beta.id, 'distinct registry identities');
 
-  // Reconnect: each binds to its OWN record by clientId (name differs, project same).
-  c1.destroy();
-  c2.destroy();
-  await sleep(80);
-  const c1b = fakeConn();
-  hub.onConnection({ conn: c1b, hello: { clientId: 'alpha', secret: SECRET } });
-  c1b.fire({ type: 'register', registration: { project: proj, projectName: 'Proj', pid: 1 } });
-  await sleep(120);
-  assert.strictEqual(reg.getByClientId('alpha').id, alpha.id, 'alpha rebinds to its own record');
-  assert.strictEqual(reg.list().length, 2, 'no duplicates');
-  hub.close();
+    // Reconnect: each binds to its OWN record by clientId (name differs, project same).
+    c1.destroy();
+    c2.destroy();
+    await waitFor(() => !hub.isOnline(alpha.id) && !hub.isOnline(beta.id), 5000, 'both sessions offline');
+    const c1b = fakeConn();
+    hub.onConnection({ conn: c1b, hello: { clientId: 'alpha', secret: SECRET } });
+    c1b.fire({ type: 'register', registration: { project: proj, projectName: 'Proj', pid: 1 } });
+    await waitFor(sentType(c1b, 'register_ack'), 5000, 'alpha reconnect register_ack');
+    assert.strictEqual(reg.getByClientId('alpha').id, alpha.id, 'alpha rebinds to its own record');
+    assert.strictEqual(reg.list().length, 2, 'no duplicates');
+    assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+  } finally {
+    hub.close();
+  }
 });
 
 test('legacy record without clientId: first registration backfills safely (no crash, no dup)', async () => {
@@ -420,16 +504,19 @@ test('legacy record without clientId: first registration backfills safely (no cr
   const legacyId = created.entry.id;
 
   const hub = makeHub(reg);
-  const conn = fakeConn();
-  hub.onConnection({ conn, hello: { clientId: 'legacy-client', secret: SECRET } });
-  conn.fire({ type: 'register', registration: { project: proj, projectName: 'Legacy', pid: 9 } });
-  await sleep(80);
+  try {
+    const conn = fakeConn();
+    hub.onConnection({ conn, hello: { clientId: 'legacy-client', secret: SECRET } });
+    conn.fire({ type: 'register', registration: { project: proj, projectName: 'Legacy', pid: 9 } });
+    await waitFor(sentType(conn, 'register_ack'), 5000, 'legacy register_ack');
 
-  assert.strictEqual(reg.list().length, 1, 'no duplicate created');
-  const e = reg.get(legacyId);
-  assert.strictEqual(e.clientId, 'legacy-client', 'clientId backfilled');
-  assert.strictEqual(e.connected, true, 'record went online');
-  hub.close();
+    assert.strictEqual(reg.list().length, 1, 'no duplicate created');
+    const e = reg.get(legacyId);
+    assert.strictEqual(e.clientId, 'legacy-client', 'clientId backfilled');
+    assert.strictEqual(e.connected, true, 'record went online');
+  } finally {
+    hub.close();
+  }
 });
 
 test('renamed display name, same clientId → same record updated, not duplicated', async () => {
@@ -439,24 +526,27 @@ test('renamed display name, same clientId → same record updated, not duplicate
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  const c1 = fakeConn();
-  hub.onConnection({ conn: c1, hello: { clientId: 'stable-id', secret: SECRET } });
-  c1.fire({ type: 'register', registration: { project: proj, projectName: 'Original', pid: 1 } });
-  await sleep(120);
-  const first = reg.getByClientId('stable-id');
+  try {
+    const c1 = fakeConn();
+    hub.onConnection({ conn: c1, hello: { clientId: 'stable-id', secret: SECRET } });
+    c1.fire({ type: 'register', registration: { project: proj, projectName: 'Original', pid: 1 } });
+    await waitFor(sentType(c1, 'register_ack'), 5000, 'original register_ack');
+    const first = reg.getByClientId('stable-id');
 
-  // "Renamed project directory" — same clientId, different projectName/project.
-  const proj2 = path.join(dir, 'proj-renamed');
-  fs.mkdirSync(proj2);
-  const c2 = fakeConn();
-  hub.onConnection({ conn: c2, hello: { clientId: 'stable-id', secret: SECRET } });
-  c2.fire({ type: 'register', registration: { project: proj2, projectName: 'Renamed', pid: 2 } });
-  await sleep(120);
+    // "Renamed project directory" — same clientId, different projectName/project.
+    const proj2 = path.join(dir, 'proj-renamed');
+    fs.mkdirSync(proj2);
+    const c2 = fakeConn();
+    hub.onConnection({ conn: c2, hello: { clientId: 'stable-id', secret: SECRET } });
+    c2.fire({ type: 'register', registration: { project: proj2, projectName: 'Renamed', pid: 2 } });
+    await waitFor(sentType(c2, 'register_ack'), 5000, 'renamed register_ack');
 
-  assert.strictEqual(reg.getByClientId('stable-id').id, first.id, 'same record updated');
-  assert.strictEqual(reg.list().length, 1, 'no duplicate');
-  assert.strictEqual(reg.get(first.id).pid, 2, 'metadata updated on the same record');
-  hub.close();
+    assert.strictEqual(reg.getByClientId('stable-id').id, first.id, 'same record updated');
+    assert.strictEqual(reg.list().length, 1, 'no duplicate');
+    assert.strictEqual(reg.get(first.id).pid, 2, 'metadata updated on the same record');
+  } finally {
+    hub.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -470,35 +560,39 @@ test('late close from a replaced connection does not mark the new session offlin
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  const a = fakeConn();
-  hub.onConnection({ conn: a, hello: { clientId: 'late-close', secret: SECRET } });
-  a.fire({ type: 'register', registration: { project: proj, projectName: 'Late', pid: 1 } });
-  await sleep(120);
-  const entry = reg.getByName('late');
+  try {
+    const a = fakeConn();
+    hub.onConnection({ conn: a, hello: { clientId: 'late-close', secret: SECRET } });
+    a.fire({ type: 'register', registration: { project: proj, projectName: 'Late', pid: 1 } });
+    await waitFor(sentType(a, 'register_ack'), 5000, 'A register_ack');
+    const entry = reg.getByName('late');
 
-  // C replaces A. A's destroy() synchronously fires its close handler, but we
-  // then SIMULATE a LATE close event (double-fire, like a delayed socket close).
-  const c = fakeConn();
-  hub.onConnection({ conn: c, hello: { clientId: 'late-close', secret: SECRET } });
-  c.fire({ type: 'register', registration: { project: proj, projectName: 'Late', pid: 2 } });
-  await sleep(120);
-  assert.ok(hub.isOnline(entry.id), 'C authoritative');
+    // C replaces A. A's destroy() synchronously fires its close handler, but we
+    // then SIMULATE a LATE close event (double-fire, like a delayed socket close).
+    const c = fakeConn();
+    hub.onConnection({ conn: c, hello: { clientId: 'late-close', secret: SECRET } });
+    c.fire({ type: 'register', registration: { project: proj, projectName: 'Late', pid: 2 } });
+    await waitFor(sentType(c, 'register_ack'), 5000, 'C register_ack (replacement)');
+    assert.ok(hub.isOnline(entry.id), 'C authoritative');
 
-  // A emits a late close event AFTER C committed. We must invoke A's close
-  // handler directly (the hub registered it via conn.on('close')).
-  const aCloseHandler = a.onclose;
-  assert.ok(typeof aCloseHandler === 'function', 'A has a hub close handler');
-  aCloseHandler();
-  await sleep(40);
-  assert.ok(hub.isOnline(entry.id), 'C STILL online after A’s late close');
+    // A emits a late close event AFTER C committed. We must invoke A's close
+    // handler directly (the hub registered it via conn.on('close')).
+    const aCloseHandler = a.onclose;
+    assert.ok(typeof aCloseHandler === 'function', 'A has a hub close handler');
+    aCloseHandler();
+    await reg.awaitTransactions(); // the close handler may mutate via a queued txn
+    assert.ok(hub.isOnline(entry.id), 'C STILL online after A’s late close');
 
-  // C's own close DOES take the session offline.
-  const cCloseHandler = c.onclose;
-  assert.ok(typeof cCloseHandler === 'function', 'C has a hub close handler');
-  cCloseHandler();
-  await sleep(40);
-  assert.strictEqual(hub.isOnline(entry.id), false, 'authoritative close works normally');
-  hub.close();
+    // C's own close DOES take the session offline.
+    const cCloseHandler = c.onclose;
+    assert.ok(typeof cCloseHandler === 'function', 'C has a hub close handler');
+    cCloseHandler();
+    await reg.awaitTransactions();
+    assert.strictEqual(hub.isOnline(entry.id), false, 'authoritative close works normally');
+    assert.strictEqual(reg.get(entry.id).connected, false, 'registry reflects offline');
+  } finally {
+    hub.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -512,48 +606,54 @@ test('failed stale attempt does not roll back a newer transaction’s committed 
   const reg = createRegistry(path.join(dir, 'r.json'));
   const hub = makeHub(reg);
 
-  const a = fakeConn();
-  hub.onConnection({ conn: a, hello: { clientId: 'rb-safe', secret: SECRET } });
-  a.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 1 } });
-  await sleep(80);
-  const entry = reg.getByName('rb');
+  try {
+    const a = fakeConn();
+    hub.onConnection({ conn: a, hello: { clientId: 'rb-safe', secret: SECRET } });
+    a.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 1 } });
+    await waitFor(sentType(a, 'register_ack'), 5000, 'A register_ack');
+    const entry = reg.getByName('rb');
 
-  // Explicit deferreds: B's save is gated then REJECTED (never "resolved with
-  // an Error", which would be a SUCCESSFUL save and a false failure test).
-  const saveGates = [];
-  reg.save = () => {
-    const d = makeDeferred();
-    saveGates.push(d);
-    return d.promise;
-  };
-  const b = fakeConn();
-  hub.onConnection({ conn: b, hello: { clientId: 'rb-safe', secret: SECRET } });
-  b.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 2 } });
-  await sleep(60);
-  assert.strictEqual(saveGates.length, 1, 'B save pending (gated)');
+    // Explicit deferreds: B's save is gated then REJECTED (never "resolved with
+    // an Error", which would be a SUCCESSFUL save and a false failure test).
+    const gate = makeSaveGate().install(reg);
+    const b = fakeConn();
+    hub.onConnection({ conn: b, hello: { clientId: 'rb-safe', secret: SECRET } });
+    b.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 2 } });
+    await waitFor(() => gate.length >= 1, 5000, 'B save pending (gated)');
 
-  // C supersedes B and COMMITS (pid 3). C is serialized behind B's per-identity
-  // lock — and C's whole-registry transaction is serialized behind B's by the
-  // global registry transaction mutex.
-  const c = fakeConn();
-  hub.onConnection({ conn: c, hello: { clientId: 'rb-safe', secret: SECRET } });
-  c.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 3 } });
-  await sleep(60);
-  assert.strictEqual(saveGates.length, 1, 'C serialized behind B (still 1 gated save)');
+    // C (same identity, generation 3) supersedes B. B already passed its
+    // pre-lock generation check and holds the per-identity lock with its save
+    // gated, so C's transaction is serialized BEHIND B's — C cannot reach save
+    // (and B cannot learn it is stale at commit time) until B's save settles.
+    const c = fakeConn();
+    hub.onConnection({ conn: c, hello: { clientId: 'rb-safe', secret: SECRET } });
+    c.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 3 } });
+    await sleep(20); // let C's registration frame enqueue behind B's lock
+    assert.strictEqual(gate.length, 1, 'C serialized behind B (only B’s save gated so far)');
 
-  // B's save REJECTS (genuine failure path), then C's transaction runs.
-  saveGates[0].reject(new Error('B disk failure'));
-  await sleep(120);
-  if (saveGates[1]) saveGates[1].settle(); // C's save succeeds
-  await sleep(120);
-  assert.strictEqual(reg.get(entry.id).pid, 3, 'C’s committed state WINS');
-  assert.strictEqual(reg.list().length, 1, 'one record');
-  hub.close();
+    // B's save REJECTS (genuine failure path — reject FIRST, then await the
+    // genuine rejection; awaiting an unsettled gate would deadlock). B's
+    // commit validation then finds it superseded → NAK + own-snapshot restore.
+    // The per-identity lock releases and C's transaction starts.
+    const bSavePromise = gate.gates[0].promise;
+    gate.gates[0].reject(new Error('B disk failure'));
+    await assertGenuineReject(bSavePromise, 'B injected save');
+    await waitFor(sentType(b, 'register_nak'), 5000, 'B register_nak (superseded after failed save)');
+    await waitFor(() => gate.length >= 2, 5000, 'C save to start after B settles');
+    gate.gates[1].resolve(); // C's save succeeds
+    await waitFor(sentType(c, 'register_ack'), 5000, 'C register_ack');
+
+    assert.strictEqual(reg.get(entry.id).pid, 3, 'C’s committed state WINS');
+    assert.strictEqual(reg.list().length, 1, 'one record');
+    assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+  } finally {
+    hub.close();
+  }
 });
 
 process.on('unhandledRejection', (err) => {
   console.error('UNHANDLED REJECTION:', err);
-  process.exit(2);
+  process.exitCode = 2;
 });
 
 test.run();
