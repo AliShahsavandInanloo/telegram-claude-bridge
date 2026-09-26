@@ -75,6 +75,19 @@ function freePort() {
   });
 }
 
+/**
+ * Deterministic wait: poll predicate() until true or timeout. Throws on
+ * timeout (a silent timeout success made these tests race real-disk save
+ * transactions under load).
+ */
+async function waitFor(predicate, timeoutMs, description) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`Timed out after ${timeoutMs}ms waiting for ${description}`);
+    await wait(5);
+  }
+}
+
 function wait(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -228,17 +241,18 @@ function wait(ms) {
     const c = fakeConn();
     hub.onConnection({ conn: c, hello: { clientId: 'hb-1', secret: SECRET } });
     c.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
-    await wait(60); // commit is transactional/async
+    await waitFor(() => c.sent.some((m) => m.type === 'register_ack'), 10000, 'first registration ack');
     const entry = reg.getByName('nds');
     assert.ok(entry.connected);
     // zombie cleanup: hub drops the connection
     c.destroy();
+    await reg.awaitTransactions(); // the close handler may mutate via a queued txn
     assert.strictEqual(reg.get(entry.id).connected, false, 'marked offline after cleanup');
     // reconnect: same identity
     const c2 = fakeConn();
     hub.onConnection({ conn: c2, hello: { clientId: 'hb-1', secret: SECRET } });
     c2.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
-    await wait(60);
+    await waitFor(() => c2.sent.some((m) => m.type === 'register_ack'), 10000, 're-registration ack');
     assert.strictEqual(reg.get(entry.id).connected, true, 'reconnected with same registry identity');
     assert.strictEqual(reg.list().length, 1);
     hub.close();
@@ -258,13 +272,13 @@ function wait(ms) {
     const old = fakeConn();
     hub.onConnection({ conn: old, hello: { clientId: 'dup', secret: SECRET } });
     old.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
-    await wait(60); // commit is transactional/async
+    await waitFor(() => old.sent.some((m) => m.type === 'register_ack'), 10000, 'old registration ack');
     const entry = reg.getByName('nds');
     // replacement connection with the same clientId arrives:
     const fresh = fakeConn();
     hub.onConnection({ conn: fresh, hello: { clientId: 'dup', secret: SECRET } });
     fresh.fire({ type: 'register', registration: { project: proj, projectName: 'NDS' } });
-    await wait(60);
+    await waitFor(() => old.destroyed && fresh.sent.some((m) => m.type === 'register_ack'), 10000, 'replacement commit + old conn destroyed');
     assert.ok(old.destroyed, 'old connection destroyed on replacement');
     // old socket tries to dispatch a tool:
     old.fire({ type: 'tool_call', tool: 'reply', callId: 'x1', args: { delivery_id: 'nope', text: 'hi' } });
@@ -478,11 +492,11 @@ function wait(ms) {
     const stale = fakeConn();
     hub.onConnection({ conn: stale, hello: { clientId: 'nds', secret: SECRET } });
     stale.fire({ type: 'register', registration: { project: pA, projectName: 'NDS' } });
-    await wait(60);
+    await waitFor(() => stale.sent.some((m) => m.type === 'register_ack'), 10000, 'stale registration ack');
     const newer = fakeConn();
     hub.onConnection({ conn: newer, hello: { clientId: 'nds', secret: SECRET } });
     newer.fire({ type: 'register', registration: { project: pA, projectName: 'NDS' } });
-    await wait(60);
+    await waitFor(() => stale.destroyed && newer.sent.some((m) => m.type === 'register_ack'), 10000, 'replacement commit + stale conn destroyed');
     assert.ok(stale.destroyed, 'stale replaced socket destroyed');
     stale.fire({ type: 'tool_call', tool: 'reply', callId: 'r4', args: { delivery_id: deliveryId, text: 'zombie' } });
     await wait(20);

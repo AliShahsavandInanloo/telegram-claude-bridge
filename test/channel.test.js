@@ -76,13 +76,19 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
   if (connectedSpy) connectedSpy.push(conn);
   hub.onConnection({ conn, hello: { clientId, secret: SECRET } });
   conn.fire({ type: 'register', registration: { project, projectName, channelName: 'telegram-bridge', claudeSessionId, pid: 1234, protocol: 1 } });
-  // Registration persistence is now async (transactional save with fsync);
-  // wait until the ack/nak actually arrives before assertions run.
-  return new Promise((resolve) => {
+  // Registration persistence is async (transactional save with fsync). Wait
+  // until the ack/nak actually arrives; a timeout THROWS (it is a test
+  // failure, never a silent success — a silent timeout made the assertions
+  // below race the transaction under load).
+  return new Promise((resolve, reject) => {
     const started = Date.now();
     (function poll() {
-      if (conn.sent.some((m) => m.type === 'register_ack' || m.type === 'register_nak') || Date.now() - started > 2000) {
+      if (conn.sent.some((m) => m.type === 'register_ack' || m.type === 'register_nak')) {
         resolve(conn);
+        return;
+      }
+      if (Date.now() - started > 10000) {
+        reject(new Error(`registerConn: no register_ack/nak within 10s for ${projectName}`));
         return;
       }
       setTimeout(poll, 5);
@@ -184,6 +190,7 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     const entry1 = reg.getByName('nds');
     // simulate disconnect
     c1.destroy(); // fires the hub's close listener
+    await reg.awaitTransactions(); // the close handler may mutate via a queued txn
     assert.strictEqual(reg.getByName('nds').connected, false, 'offline after disconnect');
     // reconnect with the SAME clientId
     const c2 = await registerConn(hub, reg, { clientId: 'same', project: proj, projectName: 'NDS' });

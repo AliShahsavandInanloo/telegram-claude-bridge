@@ -63,6 +63,12 @@ route, and how many users are authorized.
 
 ## Global installation
 
+Installation options:
+
+- **Manual/global install** (below) — the standard, recommended path.
+- **[Install with an AI coding agent](#install-with-an-ai-coding-agent-optional)**
+  — optional; an agent performs the same steps using the same installer.
+
 Install the Channel **once** for this Windows user — then any project can use it
 with no `.mcp.json`, no manually exported port, and no manually copied secret:
 
@@ -110,6 +116,33 @@ npm run uninstall-global        # removes only what it created
 Both are safe to re-run; uninstall never touches `.env`, `state/`,
 `node_modules/`, your other MCP servers, or hand-written files. Full details in
 [DOCUMENTATION.md §Global installation](DOCUMENTATION.md#global-installation).
+
+## Install with an AI coding agent (optional)
+
+If you use Claude Code, Codex, or another coding agent, it can perform the
+installation and verification for you — using the same supported
+`npm run install-global` installer, not a second one. An AI agent is **not**
+required; the manual/global install above always works.
+
+1. Open your coding agent.
+2. Copy the prompt from [AGENT_INSTALL.md](./AGENT_INSTALL.md).
+3. Let the agent verify prerequisites and install the Bridge.
+4. Enter Telegram secrets locally (in `.env`) when requested — never in the chat.
+
+Quick prompt:
+
+```text
+Install telegram-claude-bridge from:
+https://github.com/AliShahsavandInanloo/telegram-claude-bridge
+
+Follow the repository's AGENT_INSTALL.md exactly.
+Use the existing npm run install-global installer.
+Do not expose or commit secrets.
+Verify the Bridge, global telegram-bridge MCP registration, and the
+claude-telegram command when finished.
+```
+
+The full detailed prompt lives in [AGENT_INSTALL.md](./AGENT_INSTALL.md).
 
 ## Telegram commands
 
