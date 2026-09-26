@@ -61,6 +61,54 @@ Startup registers the commands with Telegram (`setMyCommands`), so typing `/` in
 the chat shows an autocomplete menu. The log shows the bot name, chosen proxy
 route, and how many users are authorized.
 
+## Global installation
+
+Install the Channel **once** for this Windows user — then any project can use it
+with no `.mcp.json`, no manually exported port, and no manually copied secret:
+
+```cmd
+cd <bridge>
+npm run install-global
+```
+
+| Command | Effect |
+|---|---|
+| `telegram-claude-bridge` | starts the central Bridge (the only Telegram poller) |
+| `claude-telegram` | Claude Code in the **current** project, Channel enabled |
+
+End-user flow:
+
+```cmd
+npm run install-global          # one time
+telegram-claude-bridge          # start the Bridge (once)
+
+cd I:\Claude\NDS
+claude-telegram                 # any project — no .mcp.json needed
+```
+
+`claude-telegram` runs `claude --dangerously-load-development-channels
+server:telegram-bridge` in the directory you invoked it from; plain `claude` is
+never modified. The MCP server is registered at **user scope**, so
+`claude mcp get telegram-bridge` reports *"User config (available in all your
+projects)"*.
+
+**How the port and secret are resolved.** The registered entry point is
+`scripts/launch-channel.js`. It reads the Bridge `.env` for
+`CLAUDE_CHANNEL_PORT` (one source of truth — no hardcoded port), reads the hub
+secret from `state/channel-secret` (or `CLAUDE_CHANNEL_SECRET_FILE`), exports
+both into its own process, and runs the Channel in-process. The secret is never
+stored in the MCP configuration, never committed, never on a command line, and
+never printed.
+
+```cmd
+npm run install-global          # idempotent — replaces its own entry, never duplicates
+npm run uninstall-global        # removes only what it created
+```
+
+Both are safe to re-run; uninstall never touches `.env`, `state/`,
+`node_modules/`, your other MCP servers, or hand-written files. Full details in
+[DOCUMENTATION.md §Global installation](DOCUMENTATION.md#global-installation).
+
 ## Telegram commands
 
 | Command | Effect |
@@ -183,7 +231,7 @@ Later restarts resume from the saved offset.
 npm test
 ```
 
-141 sandboxed tests (30 + 59 + 16 + 17 + 19) cover auth, prompt passing, session lifecycle,
+270 sandboxed tests (30 + 59 + 16 + 17 + 19 + 20 + 18 + 10 + 10 + 35 + 36) cover auth, prompt passing, session lifecycle,
 queue fairness and close semantics, proxy parsing/redaction, atomic
 persistence, first-start backlog skipping (empty and non-empty), at-most-once
 offset ordering incl. persistence-failure blocking, offset state categories
@@ -192,7 +240,11 @@ offset ordering incl. persistence-failure blocking, offset state categories
 hard failures for anything unparseable), spawn-argv verification
 (`shell:false`, prefix order, `--resume`), session rollback on failed saves,
 structure-based legacy migration, temp-file cleanup, and `/status` privacy.
-No network or `claude` process is touched.
+The 36 global-installation tests cover launcher secret/port resolution and
+precedence, refusal paths, wrapper generation and ownership markers, MCP argv
+construction, and the installer's dry-run / anti-clobber / idempotency
+behaviour — all against injected temp directories, never the real
+`~/.claude.json`. No network or `claude` process is touched.
 
 ## Troubleshooting
 

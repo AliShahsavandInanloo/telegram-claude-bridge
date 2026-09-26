@@ -492,7 +492,20 @@ Claude replies with the reply tool → hub validates session↔chat mapping
 **Starting a Channel-enabled session** (research preview requires the dev
 flag; custom channels are not yet on Anthropic's allowlist):
 
-1. One-time: register the channel in the project's `.mcp.json`:
+Preferred — **global install** (one user-scope MCP entry, no per-project
+`.mcp.json`, no manually exported port or secret):
+
+1. One-time: `npm run install-global`
+2. `telegram-claude-bridge` (start the Bridge once) — then, in ANY project:
+   `claude-telegram`
+3. Accept the development-channels prompt on first launch.
+
+See [Global installation](#global-installation) below for what this registers.
+
+Alternative — **per-project `.mcp.json`** (the original explicit setup; still
+supported):
+
+1. Register the channel in the project's `.mcp.json`:
    ```json
    { "mcpServers": { "telegram-bridge": {
        "command": "node",
@@ -655,6 +668,81 @@ outside the project is refused instead of silently writing outside.
 Malformed, oversized (> 512 KiB) or non-loopback frames/connections are
 dropped; everything is authenticated with the per-install secret from
 `state/channel-secret` (never the bot token or any API credential).
+
+### Global installation
+
+Installs the Channel **once** for the current Windows user, so no project ever
+needs its own `.mcp.json`, and the port and channel secret are never typed
+again.
+
+```cmd
+cd <bridge>
+npm run install-global
+```
+
+That single command does three things:
+
+1. **Registers the MCP server at USER scope.** `claude mcp add -s user
+   telegram-bridge -- node <bridge>\scripts\launch-channel.js` — visible in
+   every project (`claude mcp get telegram-bridge` reports *"User config
+   (available in all your projects)"*). The command line contains **paths
+   only**: no secret, no token.
+2. **Installs two wrapper commands** into a directory already on the user PATH
+   (`~/.local/bin`; override with `--bin-dir`):
+
+   | Command | Effect |
+   |---|---|
+   | `telegram-claude-bridge` | starts the central Bridge (the only Telegram poller) |
+   | `claude-telegram` | launches Claude Code **in the current directory** with the Channel enabled |
+
+3. **Verifies** the registration and prints the next steps.
+
+`claude-telegram` is exactly:
+
+```cmd
+claude --dangerously-load-development-channels server:telegram-bridge
+```
+
+with the current working directory left untouched (so Claude operates on the
+project you ran it in), while the plain `claude` command is not modified at all.
+
+**Where the port and secret come from.** `scripts/launch-channel.js` is the
+registered MCP entry point. At runtime it:
+
+- loads the Bridge `.env` (`applyEnvFile`) and takes `CLAUDE_CHANNEL_PORT` from
+  it — the same single source of truth the Bridge itself uses (this install
+  resolves `8766`, not a hardcoded default);
+- reads the hub secret **from disk**: `CLAUDE_CHANNEL_SECRET_FILE` if set, else
+  `state/channel-secret`;
+- exports both into its own process and runs the Channel in-process (no
+  subprocess, no shell, no secret in any argv);
+- prints nothing secret — `node scripts/launch-channel.js --selftest` reports
+  `{port, secretSource, secretLength}` only.
+
+So the secret stays in the same 0600 file the Bridge already generates: it is
+never written to `~/.claude.json`, never committed, and never lands in a command
+line. An exported `CLAUDE_CHANNEL_SECRET` still takes precedence, so the manual
+per-project mode above keeps working unchanged.
+
+**Maintenance:**
+
+```cmd
+npm run install-global      # idempotent: replaces our own entry, never duplicates
+npm run uninstall-global    # removes only what this installer created
+```
+
+`install-global` refuses to overwrite a user-scope server named
+`telegram-bridge` that it did not create, and both commands leave unrelated MCP
+servers and project configuration alone. Uninstall deletes a wrapper only when
+it carries this installer's marker, and never touches `.env`, `state/`, or
+`node_modules/`.
+
+**Verifying from an unrelated directory** (no `.mcp.json` present):
+
+```cmd
+claude mcp get telegram-bridge     # Scope: User config … Status: ✔ Connected
+node <bridge>\scripts\launch-channel.js --selftest
+```
 
 ### Legacy stream-json managed sessions
 
