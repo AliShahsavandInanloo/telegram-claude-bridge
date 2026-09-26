@@ -96,19 +96,26 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
   // ---------------- IPC: framing + auth (real sockets, loopback) ------------
 
   await test('ipc: framed JSON round-trip over loopback TCP', async () => {
+    let serverSide = null;
     const raw = net.createServer((s) => {
-      const f = attachFraming(s);
-      f.on('message', (m) => f.send({ type: 'echo_ok', got: m.v }));
+      serverSide = attachFraming(s);
+      serverSide.on('message', (m) => serverSide.send({ type: 'echo_ok', got: m.v }));
     });
     await new Promise((res) => raw.listen(0, '127.0.0.1', res));
     const port = raw.address().port;
+    let clientSide = null;
     const got = await new Promise((resolve) => {
       const s = net.connect(port, '127.0.0.1');
-      const f = attachFraming(s);
-      f.on('message', (m) => resolve(m));
-      f.on('close', () => resolve(null));
-      s.on('connect', () => f.send({ v: 42 }));
+      clientSide = attachFraming(s);
+      clientSide.on('message', (m) => resolve(m));
+      clientSide.on('close', () => resolve(null));
+      s.on('connect', () => clientSide.send({ v: 42 }));
     });
+    // Close BOTH ends: raw.close() only stops listening; leaving the
+    // established connection open kept a Socket handle alive and prevented
+    // the process from exiting when the runner finished.
+    try { clientSide.close(); } catch { /* ignore */ }
+    try { if (serverSide) serverSide.close(); } catch { /* ignore */ }
     raw.close();
     assert.ok(got && got.type === 'echo_ok' && got.got === 42, 'framed JSON round-trip works');
   });

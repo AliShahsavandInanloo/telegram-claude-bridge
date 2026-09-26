@@ -102,6 +102,17 @@ function makeRegistry(file) {
     },
     setStatus: (id, s) => { const e = entries.get(String(id)); if (e) e.status = s; },
     touch: (id) => { const e = entries.get(String(id)); if (e) e.lastActivity = new Date().toISOString(); },
+    getByClientId: (clientId) => {
+      const c = String(clientId || '');
+      if (!c) return null;
+      for (const e of entries.values()) if (e.clientId === c) return e;
+      return null;
+    },
+    setClientId: (id, clientId) => {
+      const e = entries.get(String(id));
+      if (e && typeof clientId === 'string' && clientId) e.clientId = clientId;
+      return !!e;
+    },
     attach: (chatId, id) => { attached.set(String(chatId), String(id)); return { ok: true }; },
     attached: (chatId) => entries.get(attached.get(String(chatId))) || null,
     detach: (chatId) => { attached.delete(String(chatId)); return { ok: true }; },
@@ -116,6 +127,7 @@ function makeRegistry(file) {
       attached.clear();
       for (const [k, v] of snap.attachments) attached.set(k, v);
     },
+    withTransaction: async (fn) => fn(),
     saveCalls: 0,
     save: () => { /* incremented via saveImpl below */ },
   };

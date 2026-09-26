@@ -101,6 +101,42 @@ async function waitRegistered(link, timeoutMs = 8000) {
   });
 }
 
+/**
+ * Explicit deferred — the ONLY sanctioned way to gate/complete injected
+ * reg.save promises in this file. Guards against the "resolve with an Error
+ * object" mistake: deferred.resolve(err) throws instead of resolving.
+ */
+function makeDeferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return {
+    promise,
+    resolve(value) {
+      if (value instanceof Error) throw new TypeError('deferred.resolve(Error) — use deferred.reject(err) to inject a save FAILURE');
+      resolve(value);
+    },
+    reject(err) {
+      if (!(err instanceof Error)) throw new TypeError('deferred.reject(err) requires an Error');
+      reject(err);
+    },
+    /** Raw settle (success) for gates that only ever succeed. */
+    settle: resolve,
+  };
+}
+
+/** Assert a promise genuinely REJECTS with an Error (failure-path guard). */
+async function assertGenuineReject(promise, label) {
+  let outcome = null;
+  try {
+    outcome = { kind: 'resolved', value: await promise };
+  } catch (err) {
+    outcome = { kind: 'rejected', err };
+  }
+  assert.strictEqual(outcome.kind, 'rejected', `${label}: promise must REJECT (a resolution — even with an Error object — is a save SUCCESS and does not exercise the failure path)`);
+  assert.ok(outcome.err instanceof Error, `${label}: rejection reason must be an Error`);
+  return outcome.err;
+}
+
 // ---------------------------------------------------------------------------
 // 1. Dead candidate commit
 // ---------------------------------------------------------------------------
@@ -348,11 +384,11 @@ test('two clientIds on the SAME project → two distinct records, each rebinds b
   const c1 = fakeConn();
   hub.onConnection({ conn: c1, hello: { clientId: 'alpha', secret: SECRET } });
   c1.fire({ type: 'register', registration: { project: proj, projectName: 'Proj', pid: 1 } });
-  await sleep(80);
+  await sleep(120);
   const c2 = fakeConn();
   hub.onConnection({ conn: c2, hello: { clientId: 'beta', secret: SECRET } });
   c2.fire({ type: 'register', registration: { project: proj, projectName: 'Proj-2', pid: 2 } });
-  await sleep(80);
+  await sleep(120);
 
   assert.strictEqual(reg.list().length, 2, 'two distinct sessions for one project');
   const alpha = reg.getByClientId('alpha');
@@ -363,11 +399,11 @@ test('two clientIds on the SAME project → two distinct records, each rebinds b
   // Reconnect: each binds to its OWN record by clientId (name differs, project same).
   c1.destroy();
   c2.destroy();
-  await sleep(60);
+  await sleep(80);
   const c1b = fakeConn();
   hub.onConnection({ conn: c1b, hello: { clientId: 'alpha', secret: SECRET } });
   c1b.fire({ type: 'register', registration: { project: proj, projectName: 'Proj', pid: 1 } });
-  await sleep(80);
+  await sleep(120);
   assert.strictEqual(reg.getByClientId('alpha').id, alpha.id, 'alpha rebinds to its own record');
   assert.strictEqual(reg.list().length, 2, 'no duplicates');
   hub.close();
@@ -406,7 +442,7 @@ test('renamed display name, same clientId → same record updated, not duplicate
   const c1 = fakeConn();
   hub.onConnection({ conn: c1, hello: { clientId: 'stable-id', secret: SECRET } });
   c1.fire({ type: 'register', registration: { project: proj, projectName: 'Original', pid: 1 } });
-  await sleep(80);
+  await sleep(120);
   const first = reg.getByClientId('stable-id');
 
   // "Renamed project directory" — same clientId, different projectName/project.
@@ -415,7 +451,7 @@ test('renamed display name, same clientId → same record updated, not duplicate
   const c2 = fakeConn();
   hub.onConnection({ conn: c2, hello: { clientId: 'stable-id', secret: SECRET } });
   c2.fire({ type: 'register', registration: { project: proj2, projectName: 'Renamed', pid: 2 } });
-  await sleep(80);
+  await sleep(120);
 
   assert.strictEqual(reg.getByClientId('stable-id').id, first.id, 'same record updated');
   assert.strictEqual(reg.list().length, 1, 'no duplicate');
@@ -437,7 +473,7 @@ test('late close from a replaced connection does not mark the new session offlin
   const a = fakeConn();
   hub.onConnection({ conn: a, hello: { clientId: 'late-close', secret: SECRET } });
   a.fire({ type: 'register', registration: { project: proj, projectName: 'Late', pid: 1 } });
-  await sleep(80);
+  await sleep(120);
   const entry = reg.getByName('late');
 
   // C replaces A. A's destroy() synchronously fires its close handler, but we
@@ -445,7 +481,7 @@ test('late close from a replaced connection does not mark the new session offlin
   const c = fakeConn();
   hub.onConnection({ conn: c, hello: { clientId: 'late-close', secret: SECRET } });
   c.fire({ type: 'register', registration: { project: proj, projectName: 'Late', pid: 2 } });
-  await sleep(80);
+  await sleep(120);
   assert.ok(hub.isOnline(entry.id), 'C authoritative');
 
   // A emits a late close event AFTER C committed. We must invoke A's close
@@ -469,7 +505,7 @@ test('late close from a replaced connection does not mark the new session offlin
 // 10. Stale snapshot restore cannot overwrite a newer committed state
 // ---------------------------------------------------------------------------
 
-test('failed stale attempt does not roll back a newer transaction’s committed state', async () => {
+test('failed stale attempt does not roll back a newer transaction’s committed state (REAL rejection)', async () => {
   const dir = tmpDir();
   const proj = path.join(dir, 'proj');
   fs.mkdirSync(proj);
@@ -482,29 +518,33 @@ test('failed stale attempt does not roll back a newer transaction’s committed 
   await sleep(80);
   const entry = reg.getByName('rb');
 
-  // B: snapshot taken, then save fails SLOWLY (after C already committed).
-  let bSnapshotTaken = false;
-  let releaseB = null;
-  const origSnapshot = reg.snapshot.bind(reg);
-  const pending = [];
-  reg.save = () => new Promise((resolve) => pending.push(resolve));
+  // Explicit deferreds: B's save is gated then REJECTED (never "resolved with
+  // an Error", which would be a SUCCESSFUL save and a false failure test).
+  const saveGates = [];
+  reg.save = () => {
+    const d = makeDeferred();
+    saveGates.push(d);
+    return d.promise;
+  };
   const b = fakeConn();
   hub.onConnection({ conn: b, hello: { clientId: 'rb-safe', secret: SECRET } });
   b.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 2 } });
   await sleep(60);
-  assert.ok(pending.length === 1, 'B save pending');
+  assert.strictEqual(saveGates.length, 1, 'B save pending (gated)');
 
-  // C supersedes B and COMMITS (pid 3). C is serialized behind B's lock.
+  // C supersedes B and COMMITS (pid 3). C is serialized behind B's per-identity
+  // lock — and C's whole-registry transaction is serialized behind B's by the
+  // global registry transaction mutex.
   const c = fakeConn();
   hub.onConnection({ conn: c, hello: { clientId: 'rb-safe', secret: SECRET } });
   c.fire({ type: 'register', registration: { project: proj, projectName: 'Rb', pid: 3 } });
   await sleep(60);
-  assert.strictEqual(pending.length, 1, 'C serialized behind B (1 pending)');
+  assert.strictEqual(saveGates.length, 1, 'C serialized behind B (still 1 gated save)');
 
-  // Fail B's save, then let C's transaction run.
-  pending[0](new Error('B disk failure')); // B fails (stale supersede guard: no restore clobber)
+  // B's save REJECTS (genuine failure path), then C's transaction runs.
+  saveGates[0].reject(new Error('B disk failure'));
   await sleep(120);
-  if (pending[1]) pending[1](); // C commits
+  if (saveGates[1]) saveGates[1].settle(); // C's save succeeds
   await sleep(120);
   assert.strictEqual(reg.get(entry.id).pid, 3, 'C’s committed state WINS');
   assert.strictEqual(reg.list().length, 1, 'one record');

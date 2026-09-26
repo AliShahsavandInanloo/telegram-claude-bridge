@@ -112,12 +112,20 @@ The hub binds a **stable loopback port** (`CLAUDE_CHANNEL_PORT`, default
 no need to restart Claude Code; the full registration handshake (through
 `register_ack`) runs again on every reconnect, and the session re-binds to
 the same registry record (keyed by its persisted clientId). Registration is
-atomic and serialized per session: a session becomes routable only after
-its registry record is durably persisted, a failed persist or a superseded
-candidate rolls back and retries with backoff, a replacement connection
-never retires the old one until it is safely committed, and stale/late
-socket events cannot disturb the authoritative session. If the port is
-occupied the bridge refuses
+atomic and serialized: registry transactions are GLOBALLY isolated (one
+whole-registry snapshot/mutate/persist/rollback cycle at a time, so a
+failed registration for one session can never corrupt another's committed
+record), same-client connection ordering stays per session, a session
+becomes routable only after its registry record is durably persisted, a
+failed persist or a superseded candidate rolls back cleanly and retries
+with backoff (rejected attempts leave no staged metadata behind), a
+replacement connection never retires the old one until it is safely
+committed, and stale/late socket events cannot disturb the authoritative
+session. Note: the channel's clientId is generated at Channel-process
+start — it survives a Bridge restart while the Claude Code session stays
+alive, but a Channel process restart may generate a new clientId (the
+offline name+project record is then reused, never duplicated). If the port
+is occupied the bridge refuses
 to start (never a silent random port). Liveness is enforced by a heartbeat
 (`CLAUDE_CHANNEL_HEARTBEAT_MS` / `…_TIMEOUT_MS`); zombie connections are
 dropped and cannot dispatch tools. Clients reconnect with bounded

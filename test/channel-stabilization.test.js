@@ -549,7 +549,10 @@ function wait(ms) {
     ? `\n${passed} passed, ${failures.length} FAILED`
     : `\nAll ${passed} channel-stabilization tests passed.`;
   console.log(summary);
-  if (failures.length) process.exit(1);
+  // The suite spawns child processes / sockets via bridge.js integration
+  // paths; lingering handles previously kept the runner alive after ALL
+  // tests passed. Exit explicitly: 0 = green, 1 = failures.
+  process.exit(failures.length ? 1 : 0);
 })().catch((err) => {
   console.error('stabilization runner crashed:', err);
   process.exit(1);

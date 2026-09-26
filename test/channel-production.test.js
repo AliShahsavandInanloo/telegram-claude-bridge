@@ -135,6 +135,8 @@ function makeRegistry() {
       attached.clear();
       for (const [k, v] of snap.attachments) attached.set(k, v);
     },
+    withTransaction: async (fn) => fn(),
+    transactionBusy: () => false,
   };
 }
 
