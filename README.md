@@ -1,314 +1,234 @@
-# Telegram ↔ Claude Code bridge
+# telegram-claude-bridge
 
-Chat with a local **Claude Code** harness from any Telegram bot you own. Built for
-censored networks: where Telegram is banned, bot traffic can flow through whatever
-VPN/proxy you run. **Nothing is hard-coded** — the bridge auto-detects the route:
+Control a local **Claude Code** installation from a Telegram bot. Send a message
+in the chat, Claude works on it in one of your projects and replies — with files,
+across multiple sessions, through whatever proxy your network needs. **Nothing is
+hard-coded**: the bridge auto-detects the network route (`TELEGRAM_PROXY_URL` →
+`HTTPS_PROXY`/`ALL_PROXY` env vars → Windows system proxy → direct), so you can
+start and stop your VPN whenever you like.
 
-1. `TELEGRAM_PROXY_URL` in `.env` (optional explicit override)
-2. `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` environment variables
-3. **Windows system proxy** (read live from the registry — what v2rayN-style clients toggle)
-4. Direct connection
+## What it can do
 
-Bot API calls go through `https.request` (not `fetch`), so HTTP(S) and SOCKS proxy
-agents actually apply. Local proxies (`127.0.0.1`, `localhost`) are fully supported.
-The route is re-checked whenever a request fails (and every 60 s), so you can
-start/stop your VPN whenever you like and the bridge recovers on its own.
+- Control Claude Code from Telegram (with allowlist-only access)
+- Talk to **live** Claude Code sessions through a custom Channel
+- Run headless **one-shot** Claude jobs
+- Run managed **stream** sessions (long-running background processes)
+- Switch a chat between sessions, list files, download project files
+- Install the Channel **once per user** — no per-project `.mcp.json`
+- Use one central bot for all sessions (single Telegram poller)
 
-Your model provider setup is untouched: the bridge just spawns the `claude` CLI,
-which reads your own `~/.claude/settings.json` (any `ANTHROPIC_BASE_URL` relay,
-custom model mappings, etc. all keep working).
+## How it works
 
-## Security model (read this first)
+```
+Telegram ↔ Bridge ↔ Claude session
+```
 
-Authorization is **fail closed**: the bridge refuses to start unless
-`ALLOWED_TELEGRAM_IDS` lists your numeric Telegram user ID(s). Unknown users are
-ignored and can never enqueue work, create sessions, or see status.
+- **CHANNEL** → a live Claude Code session (native two-way integration)
+- **ONE-SHOT** → a headless Claude invocation (`claude -p`), no terminal needed
+- **STREAM** → a managed background Claude process the bridge owns
 
-Every job runs `claude -p` **with `--dangerously-skip-permissions`** in the
-configured working directory — that means anyone who can talk to the bot can run
-arbitrary commands on this machine. The allowlist is the security boundary:
-keep it to you and people you trust, and never ship a `.env` with it empty.
+Details and internals: [DOCUMENTATION.md](DOCUMENTATION.md).
 
-## One-time setup
+## Security (read this first)
+
+- Access is **allowlist-only**: the bridge refuses to start without
+  `ALLOWED_TELEGRAM_IDS`, and unknown users are ignored.
+- Jobs run Claude **with `--dangerously-skip-permissions`** — anyone who can
+  talk to the bot can run arbitrary commands on your computer. Keep the
+  allowlist to people you trust.
+- Never commit or share `.env` or your bot token.
+- Only **one** process may poll Telegram for a given bot token.
+- The Channel IPC is local-only (127.0.0.1) and authenticated with a dedicated
+  secret — never the bot token.
+
+## Quick start
+
+### 1. Prerequisites
+
+- Windows (primary target), Git, Node.js 20+, npm
+- Claude Code installed and working
+- A Telegram bot token (from [@BotFather](https://t.me/BotFather))
+- Your numeric Telegram user ID (from @userinfobot)
+
+### 2. Clone
 
 ```cmd
 git clone https://github.com/AliShahsavandInanloo/telegram-claude-bridge.git
 cd telegram-claude-bridge
-npm install
+```
+
+### 3. Install dependencies
+
+```cmd
+npm ci
+```
+
+### 4. Create the configuration
+
+```cmd
 copy .env.example .env
 ```
 
-(Linux/macOS: `cp .env.example .env`)
+Then edit `.env` and fill in the two required values:
 
-Then edit `.env` — both variables are required:
-
-- `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather) for **your** bot
-- `ALLOWED_TELEGRAM_IDS` — your numeric Telegram user ID(s), comma-separated (get
-  them from @userinfobot)
-
-Optional: `TELEGRAM_PROXY_URL`, `CLAUDE_BIN`, `BRIDGE_CWD`, `CLAUDE_TIMEOUT_MS`,
-`MAX_QUEUE_PER_CHAT`, `MAX_STDOUT_BYTES`, `MAX_STDERR_BYTES`, `BRIDGE_DEBUG`.
-
-## Run
-
-Double-click `start-bridge.cmd`, or:
-
-```cmd
-node bridge.js
+```ini
+TELEGRAM_BOT_TOKEN=<token from BotFather>
+ALLOWED_TELEGRAM_IDS=<your numeric Telegram user ID(s), comma-separated>
 ```
 
-Startup registers the commands with Telegram (`setMyCommands`), so typing `/` in
-the chat shows an autocomplete menu. The log shows the bot name, chosen proxy
-route, and how many users are authorized.
+Never paste secrets into public chats, and never commit `.env`.
 
-## Global installation
-
-Installation options:
-
-- **Manual/global install** (below) — the standard, recommended path.
-- **[Install with an AI coding agent](#install-with-an-ai-coding-agent-optional)**
-  — optional; an agent performs the same steps using the same installer.
-
-Install the Channel **once** for this Windows user — then any project can use it
-with no `.mcp.json`, no manually exported port, and no manually copied secret:
+### 5. Install globally
 
 ```cmd
-cd <bridge>
 npm run install-global
 ```
 
-| Command | Effect |
-|---|---|
-| `telegram-claude-bridge` | starts the central Bridge (the only Telegram poller) |
-| `claude-telegram` | Claude Code in the **current** project, Channel enabled |
+This registers, for your Windows user:
 
-End-user flow:
+- the `telegram-bridge` MCP server (user scope, visible in every project)
+- the `telegram-claude-bridge` command (starts the central Bridge)
+- the `claude-telegram` command (Claude Code with the Channel enabled)
 
-```cmd
-npm run install-global          # one time
-telegram-claude-bridge          # start the Bridge (once)
+The wrapper directory is verified against PATH; if the default is not on PATH
+the installer uses the npm global bin directory or tells you exactly what to do.
 
-cd I:\Claude\NDS
-claude-telegram                 # any project — no .mcp.json needed
-```
-
-`claude-telegram` runs `claude --dangerously-load-development-channels
-server:telegram-bridge` in the directory you invoked it from; plain `claude` is
-never modified. The MCP server is registered at **user scope**, so
-`claude mcp get telegram-bridge` reports *"User config (available in all your
-projects)"*.
-
-**How the port and secret are resolved.** The registered entry point is
-`scripts/launch-channel.js`. It reads **only** the Channel's own configuration —
-`CLAUDE_CHANNEL_PORT` from the environment or the Bridge `.env` (one source of
-truth — no hardcoded port) — and the hub secret from `state/channel-secret`
-(or `CLAUDE_CHANNEL_SECRET_FILE`), then exports just those two values into its
-own process and runs the Channel in-process. The rest of the Bridge `.env`
-(`TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_IDS`, `TELEGRAM_PROXY_URL`, …) is
-**never** loaded into the Channel process. The secret is never stored in the
-MCP configuration, never committed, never on a command line, and never printed.
+### 6. Start the Bridge
 
 ```cmd
-npm run install-global          # idempotent — replaces its own entry, never duplicates
-npm run uninstall-global        # removes only what it created
-npm run uninstall-global -- --force   # also remove a foreign "telegram-bridge" MCP registration
+telegram-claude-bridge
 ```
 
-Both are safe to re-run. The wrapper directory is **verified against PATH** —
-never assumed: if `~/.local/bin` is not on PATH the installer falls back to the
-npm global bin directory, or fails with clear remediation instead of silently
-writing commands you could never run. A non-zero exit means the installation
-or uninstall did **not** complete (skipped wrappers, failed MCP operation,
-off-PATH bin dir) — automation and AI agents should treat it as such. Uninstall
-never touches `.env`, `state/`, `node_modules/`, your other MCP servers, or
-hand-written files; `--force` applies to the MCP registration only, never to
-wrapper files. Full details in
-[DOCUMENTATION.md §Global installation](DOCUMENTATION.md#global-installation).
+The log shows the bot name, the chosen proxy route, and how many users are
+authorized. Leave it running — it is the only Telegram poller.
+
+### 7. Start Claude in any project
+
+```cmd
+cd C:\Projects\my-project
+claude-telegram
+```
+
+Accept the development-channel consent prompt if Claude Code shows one.
+Plain `claude` is never modified.
+
+### 8. Connect from Telegram
+
+In your bot's chat:
+
+```text
+/sessions
+/attach <session>       (or /switch <session>)
+```
+
+Then just send a normal message — it appears inside your live Claude Code
+session, and Claude replies back into Telegram.
 
 ## Install with an AI coding agent (optional)
 
-If you use Claude Code, Codex, or another coding agent, it can perform the
-installation and verification for you — using the same supported
-`npm run install-global` installer, not a second one. An AI agent is **not**
-required; the manual/global install above always works.
+An AI agent can perform the whole install for you — using the same supported
+installer, not a second one. Open your coding agent, copy the prompt from
+[AGENT_INSTALL.md](./AGENT_INSTALL.md), and follow its questions. An agent is
+never required; the Quick start above always works.
 
-1. Open your coding agent.
-2. Copy the prompt from [AGENT_INSTALL.md](./AGENT_INSTALL.md).
-3. Let the agent verify prerequisites and install the Bridge.
-4. Enter Telegram secrets locally (in `.env`) when requested — never in the chat.
+## Installed PC commands
 
-Quick prompt:
+| Command | Purpose |
+|---|---|
+| `telegram-claude-bridge` | starts the central Bridge |
+| `claude-telegram` | starts Claude Code in the current directory with the Channel enabled |
+| `npm run uninstall-global` | removes the global integration owned by this installation |
 
-```text
-Install telegram-claude-bridge from:
-https://github.com/AliShahsavandInanloo/telegram-claude-bridge
+Maintenance notes:
 
-Follow the repository's AGENT_INSTALL.md exactly.
-Use the existing npm run install-global installer.
-Do not expose or commit secrets.
-Verify the Bridge, global telegram-bridge MCP registration, and the
-claude-telegram command when finished.
+```cmd
+npm run install-global                # idempotent — replaces its own entry only
+npm run uninstall-global              # checks the known default wrapper locations
+npm run uninstall-global -- --force   # also remove a foreign "telegram-bridge" MCP registration
 ```
 
-The full detailed prompt lives in [AGENT_INSTALL.md](./AGENT_INSTALL.md).
+Uninstall never touches `.env`, `state/`, `node_modules/`, your other MCP
+servers, or hand-written files; `--force` applies to the MCP registration only.
+
+## Configuration (essentials)
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | yes | token from BotFather |
+| `ALLOWED_TELEGRAM_IDS` | yes | numeric Telegram user IDs allowed to use the bridge |
+| `CLAUDE_CHANNEL_PORT` | no | Channel hub port (default 8765) |
+| `TELEGRAM_PROXY_URL` | no | explicit proxy for Telegram traffic |
+| `CLAUDE_BIN` | no | path to Claude Code if not resolvable from PATH |
+
+Full reference: [DOCUMENTATION.md](DOCUMENTATION.md#configuration).
 
 ## Telegram commands
 
-| Command | Effect |
+| Command | Purpose |
 |---|---|
-| `/start`, `/help` | show the command summary |
-| `/new <name>` | create a fresh one-shot session and switch to it |
-| `/new <name> <project-path>` | create a **managed Claude session** bound to a project and attach to it |
-| `/sessions` | list sessions; `▶️` marks the active one, `(new)` = not yet used by Claude |
+| `/help` | command summary |
+| `/sessions` | list sessions; the active one is marked |
+| `/new <name>` | create a one-shot session and switch to it |
+| `/new <name> <project-path>` | create a managed session bound to a project |
 | `/use <name>` | switch the active one-shot session |
-| `/attach <name\|number>` | attach this chat to an **online Channel session** (offline targets are refused, never silently substituted) |
-| `/switch <name\|number>` | switch this chat to another connected Channel session |
-| `/detach` | detach from the managed session |
-| `/current` | show the currently attached managed session |
+| `/attach <name\|number>` | attach this chat to an online Channel session |
+| `/switch <name\|number>` | switch to another connected session |
+| `/detach` | detach from the current session |
+| `/current` | show the currently attached session |
 | `/session-status` | process state, current task, runtime, latest output |
 | `/files` | list files in the attached project |
 | `/download <file>` | send a project file back here |
-| `/discover` | list running Claude processes (read-only inventory — never attachable) |
-| `/stop` | cancel Bridge-side work for this chat (queued jobs, one-shot job). **Channel sessions keep running** — use `/terminate-session confirm` for that |
-| `/terminate-session confirm` | explicitly stop a stream-json session process |
-| `/queue` | what's running and how many jobs are queued (this chat / global) |
-| `/status` | Claude executable, active session, job state, queue, proxy (credentials redacted), uptime |
-| any other text | a task for the attached managed session — or, if none, the one-shot active session |
+| `/discover` | list running Claude processes (read-only inventory) |
+| `/queue` | what's running and how many jobs are queued |
+| `/stop` | cancel this chat's Bridge-side work (Channel sessions keep running) |
+| `/terminate-session confirm` | explicitly stop a managed session process |
+| `/status` | Claude executable, active session, queue, proxy (redacted), uptime |
 
-### Managed vs one-shot sessions
+Any other text is a task for the attached session — or the active one-shot
+session if none is attached.
 
-- **Channel sessions (preferred, interactive)**: start Claude Code in a project
-  with the custom channel enabled — messages from Telegram appear natively in
-  the live session (`← telegram-bridge · …`) and Claude replies through the
-  `reply` tool. See DOCUMENTATION.md §Channel for the exact setup.
-- **stream-json sessions (legacy/automation)**: `/new <name> <project-path>`
-  registers a session the bridge fully owns; each message is a queued task
-  via the stream-json stdin protocol. Kept for background/automation use.
-- **One-shot** (classic): each message spawns `claude -p <text>` against a
-  named conversation; the process ends when the answer is done.
-- **Discovered processes**: `/discover` lists Claude processes already running
-  on the machine. Inventory only — not attachable (a session is attachable
-  only when its Channel connection is online).
+## Session types compared
 
-### Claude → Telegram via the Bridge
+| | CHANNEL | STREAM | ONE-SHOT |
+|---|---|---|---|
+| Who starts Claude | You | Bridge | Bridge per message |
+| Process lifetime | While your live Claude Code session is open | Long-running managed process | New process for each message |
+| Conversation context persists | Yes | Yes | Yes (named conversation, resumed) |
+| Interactive Claude Code terminal | Yes | No | No |
+| Telegram messages visible in the Claude UI | Yes | No | No |
+| Good for live coding | Best fit | Not the main use | Not the main use |
+| Good for background automation | Possible | Best fit | Good for occasional work |
+| Idle resource usage | Claude session remains open | Worker remains running | Very low |
+| Needs a new session every message | No | No | No |
+| Best mental model | Remote control for live Claude Code | Persistent background worker | Lightweight headless conversation |
 
-Channel sessions never talk to Telegram directly. Claude calls the Bridge's
-`reply`/`send_file` tools over the authenticated localhost IPC; the Bridge
-validates the session→chat mapping, applies the allowlist/chunking/size caps,
-and sends with the single Telegram client. The channel secret lives in
-`state/channel-secret` (0600) and is never the bot token or any API credential.
+In short:
 
-The hub binds a **stable loopback port** (`CLAUDE_CHANNEL_PORT`, default
-8765) so live sessions **reconnect automatically after a bridge restart** —
-no need to restart Claude Code; the full registration handshake (through
-`register_ack`) runs again on every reconnect, and the session re-binds to
-the same registry record (keyed by its persisted clientId). Registration is
-atomic and serialized: registry transactions are GLOBALLY isolated (one
-whole-registry snapshot/mutate/persist/rollback cycle at a time, so a
-failed registration for one session can never corrupt another's committed
-record) — and the Claude session manager (create / attach / detach / status)
-acquires this same lock BEFORE it snapshots, mutates or saves, so its
-operations can never be erased by a concurrent rollback — same-client
-connection ordering stays per session, a session
-becomes routable only after its registry record is durably persisted, a
-failed persist or a superseded candidate rolls back cleanly and retries
-with backoff (rejected attempts leave no staged metadata behind), a
-replacement connection never retires the old one until it is safely
-committed, and stale/late socket events cannot disturb the authoritative
-session. Note: the channel's clientId is generated at Channel-process
-start — it survives a Bridge restart while the Claude Code session stays
-alive, but a Channel process restart may generate a new clientId (the
-offline name+project record is then reused, never duplicated). If the port
-is occupied the bridge refuses
-to start (never a silent random port). Liveness is enforced by a heartbeat
-(`CLAUDE_CHANNEL_HEARTBEAT_MS` / `…_TIMEOUT_MS`); zombie connections are
-dropped and cannot dispatch tools. Clients reconnect with bounded
-exponential backoff (2 s → 15 s max, reset on reconnect). Replies are
-delivery-scoped: Claude answers with the `delivery_id` from the channel
-tag (the legacy `chat_id` tool argument is deprecated and only works while
-the session is the chat's current attachment), so a reply still lands
-in the right chat even after you `/switch` sessions — and delivery records
-are persisted, so a task that outlives a Bridge restart can still reply.
-File tools accept
-project-relative nested paths; anything resolving outside the project root
-(symlink/junction/`..`/UNC escapes) is rejected — including a symlinked
-`incoming/` upload directory, which cannot redirect writes outside the
-project.
-
-Commands also work group-style: `/status@YourBot` is accepted, and commands
-addressed to a different bot are ignored.
-
-## Sessions
-
-A session is one persistent Claude conversation. `/new` allocates it locally with
-`--session-id`; the first successful run makes it resumable, and every later job
-resumes with `--resume`. Queued jobs keep the session identity they were enqueued
-with, even if you create or switch sessions meanwhile. State lives in
-`state/sessions.json` (schema v2, written atomically); old formats are
-migrated automatically.
-
-## Message delivery
-
-Updates are processed **at-most-once**: the next Telegram offset is durably
-persisted (temp file + fsync + rename) **before** an update is handled, so a
-command can be skipped after a crash but never executed twice.
-
-- **If offset persistence fails, the command is not executed.** The bridge
-  logs the failure, keeps its offset unchanged, and retries — the same update
-  is delivered again on the next poll. It never acknowledges success without
-  a durable save.
-- On the **first** start, messages sent while the bridge was offline are
-  skipped by default (`PROCESS_INITIAL_BACKLOG=false`) instead of executing
-  stale commands; set it to `true` to consume the backlog. **First
-  initialization records state even when the backlog is empty** — a restart
-  is never mistaken for another first start (which would purge new messages).
-- Corrupted or unreadable offset state is **not** treated as a clean first
-  start: the bridge backs up the corrupt file and refuses to start rather
-  than risk discarding pending commands.
-
-Later restarts resume from the saved offset.
-
-## Tests
-
-```cmd
-npm test
-```
-
-270 sandboxed tests (30 + 59 + 16 + 17 + 19 + 20 + 18 + 10 + 10 + 35 + 36) cover auth, prompt passing, session lifecycle,
-queue fairness and close semantics, proxy parsing/redaction, atomic
-persistence, first-start backlog skipping (empty and non-empty), at-most-once
-offset ordering incl. persistence-failure blocking, offset state categories
-(missing/valid/corrupt/unreadable), the Windows launch specification
-(native exe, npm `.cmd`/`.bat` shims → node + cli.js, JS entrypoints, and
-hard failures for anything unparseable), spawn-argv verification
-(`shell:false`, prefix order, `--resume`), session rollback on failed saves,
-structure-based legacy migration, temp-file cleanup, and `/status` privacy.
-The 36 global-installation tests cover launcher secret/port resolution and
-precedence, refusal paths, wrapper generation and ownership markers, MCP argv
-construction, and the installer's dry-run / anti-clobber / idempotency
-behaviour — all against injected temp directories, never the real
-`~/.claude.json`. No network or `claude` process is touched.
+- **CHANNEL** = remote control for a live Claude Code workspace.
+- **STREAM** = persistent background Claude worker managed by the Bridge.
+- **ONE-SHOT** = headless conversation that starts Claude only when a message
+  needs processing — the conversation context is kept and resumed, only the
+  process is short-lived.
 
 ## Troubleshooting
 
-- `refusing to start: ALLOWED_TELEGRAM_IDS …` → set your numeric ID(s) in `.env`.
-- `refusing to start: … .cmd launcher …` → the npm `claude.cmd` shim could not be
-  safely modeled; point `CLAUDE_BIN` at the native `claude.exe` or the CLI's
-  `cli.js` (see DOCUMENTATION.md §CLAUDE_BIN).
-- `refusing to start: CLAUDE_BIN "…" was not found on PATH` → the bare name
-  matches nothing executable; install Claude Code or set `CLAUDE_BIN`.
-- `Unable to read Telegram offset state … refusing to treat this as first startup`
-  → `state/offset.txt` is corrupt or unreadable; a `.corrupt-*.bak` backup was
-  written next to it. Inspect/restore it, then start the bridge again.
-- `cannot reach Telegram yet` repeating → your VPN is off; turn it on, the bridge
-  re-probes within 10 s. Or pin `TELEGRAM_PROXY_URL`.
-- 401 from Telegram → wrong `TELEGRAM_BOT_TOKEN`.
-- `Could not run Claude` → check `claude -p "hi"` works in a terminal; set
-  `CLAUDE_BIN` if `claude` isn't on PATH.
-- Large replies are split into chunks; stdout/stderr capture is bounded
-  (`MAX_STDOUT_BYTES`/`MAX_STDERR_BYTES`) with truncation markers.
+- **`EADDRINUSE 127.0.0.1:<port>`** — the Channel port is taken. Find the
+  owning process (`netstat -ano | findstr :<port>`), stop it, or set another
+  `CLAUDE_CHANNEL_PORT` in `.env`.
+- **Telegram errors about getUpdates conflict** — another process is polling
+  the same bot token. Stop the other poller; only one is allowed.
+- **My session never appears in `/sessions`** — start Claude with
+  `claude-telegram` (not plain `claude`) so the Channel connects to the Bridge.
+- **`cannot reach Telegram yet`** — your VPN/proxy is down or Telegram is
+  blocked; the bridge re-probes automatically, or pin `TELEGRAM_PROXY_URL`.
+- **401 from Telegram** — wrong `TELEGRAM_BOT_TOKEN`.
+- **`refusing to start: ALLOWED_TELEGRAM_IDS …`** — set your numeric ID(s).
+- **Claude launch/shim errors** — point `CLAUDE_BIN` at the native
+  `claude.exe` or the CLI's `cli.js`.
+- **Offset state errors on startup** — `state/offset.txt` was corrupt; a
+  `.corrupt-*.bak` backup was written. Inspect it, then start again.
 
 ---
 
-📖 **Full technical documentation:** [DOCUMENTATION.md](DOCUMENTATION.md) — architecture,
-session lifecycle, proxy-resolution internals, security model, .env reference, and troubleshooting.
+Need details? See [DOCUMENTATION.md](DOCUMENTATION.md) — architecture, session
+lifecycle, full configuration reference, and the development/test guide.

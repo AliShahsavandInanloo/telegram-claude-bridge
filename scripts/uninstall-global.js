@@ -22,10 +22,11 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const LAUNCHER = path.join(ROOT, 'scripts', 'launch-channel.js');
 
+const os = require('os');
 const {
   MCP_SERVER_NAME,
   WRAPPER_NAMES,
-  defaultBinDir,
+  defaultWrapperDirs,
   isManaged,
   buildMcpRemoveArgs,
   isOwnRegistration,
@@ -81,10 +82,21 @@ function main(argv = process.argv.slice(2)) {
   }
 
   const log = opts.json ? () => {} : (m) => process.stdout.write(`${m}\n`);
-  const binDir = opts.binDir ? path.resolve(opts.binDir) : defaultBinDir();
-  const result = { dryRun: opts.dryRun, binDir, mcp: null, wrappers: [] };
+  // WHERE to look for wrappers: an explicit --bin-dir restricts the search to
+  // exactly that directory (predictable operations). Otherwise scan the
+  // installer's KNOWN default candidate locations (~/.local/bin and the npm
+  // global bin dir) — NOT the user's current PATH, which may have changed
+  // since installation and must never become a deletion surface. Only files
+  // carrying this installer's marker are ever removed, so scanning two
+  // user-owned defaults is safe (covers wrappers installed via the
+  // %APPDATA%\npm fallback when ~/.local/bin was not on PATH).
+  const binDirs = opts.binDir
+    ? [path.resolve(opts.binDir)]
+    : defaultWrapperDirs({ env: process.env, home: os.homedir(), platform: process.platform });
+  const result = { dryRun: opts.dryRun, binDirs, mcp: null, wrappers: [] };
 
   log(`telegram-bridge — global uninstall${opts.dryRun ? ' (dry run)' : ''}`);
+  for (const d of binDirs) log(`  looking in  : ${d}`);
 
   // ---- MCP registration ----------------------------------------------------
   const entry = readUserMcpEntry(MCP_SERVER_NAME);
@@ -107,23 +119,32 @@ function main(argv = process.argv.slice(2)) {
   }
 
   // ---- Wrapper commands ----------------------------------------------------
+  // Every wrapper name may exist in more than one candidate location (e.g.
+  // after a PATH fallback install); ALL installer-owned copies are removed
+  // and reported. Unmanaged same-name files are never touched.
   for (const name of WRAPPER_NAMES) {
-    const target = path.join(binDir, name);
-    let content = null;
-    try {
-      content = fs.readFileSync(target, 'utf8');
-    } catch {
+    let foundInAnyDir = false;
+    for (const dir of binDirs) {
+      const target = path.join(dir, name);
+      let content = null;
+      try {
+        content = fs.readFileSync(target, 'utf8');
+      } catch {
+        continue; // not in this candidate directory
+      }
+      foundInAnyDir = true;
+      if (!isManaged(content)) {
+        result.wrappers.push({ name, path: target, action: 'skipped', reason: 'not created by this installer' });
+        log(`  wrapper: SKIPPED ${target} — not created by this installer`);
+        continue;
+      }
+      if (!opts.dryRun) fs.unlinkSync(target);
+      result.wrappers.push({ name, path: target, action: opts.dryRun ? 'would-remove' : 'removed' });
+      log(`  wrapper: ${opts.dryRun ? 'would remove' : 'removed'} ${target}`);
+    }
+    if (!foundInAnyDir) {
       result.wrappers.push({ name, action: 'absent' });
-      continue;
     }
-    if (!isManaged(content)) {
-      result.wrappers.push({ name, action: 'skipped', reason: 'not created by this installer' });
-      log(`  wrapper: SKIPPED ${name} — not created by this installer`);
-      continue;
-    }
-    if (!opts.dryRun) fs.unlinkSync(target);
-    result.wrappers.push({ name, action: opts.dryRun ? 'would-remove' : 'removed', path: target });
-    log(`  wrapper: ${opts.dryRun ? 'would remove' : 'removed'} ${target}`);
   }
 
   log('');

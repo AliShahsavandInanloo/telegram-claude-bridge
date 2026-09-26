@@ -808,6 +808,279 @@ async function main() {
     }
   });
 
+  // ------------------------------------------------------------------------
+  // Replacement-correctness pass: remove-failure aborts, the full
+  // remove/add/rollback matrix, uninstall wrapper discovery across the known
+  // default locations, --no-wrappers independence, stray positionals.
+  // ------------------------------------------------------------------------
+
+  console.log('global install: replacement matrix (remove -> add -> rollback)');
+
+  /** Build an OWN registration in a temp home and capture runClaude calls. */
+  function setupOwnRegistration() {
+    const home = tmpDir();
+    const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({ mcpServers: { 'telegram-bridge': { type: 'stdio', command: 'node', args: [ours] } } }),
+      'utf8',
+    );
+    return { home, ours };
+  }
+
+  /** Stub installer.runClaude with a scripted sequence of outcomes. */
+  function stubRunClaude(sequence) {
+    const calls = [];
+    const orig = installer.runClaude;
+    installer.runClaude = (args) => {
+      calls.push(args.slice(0, 2).join(' '));
+      const kind = args[1] === 'remove' ? 'remove' : 'add';
+      // Consume a scripted outcome ONLY when its kind matches the current
+      // call kind — otherwise the remove call would swallow an add outcome.
+      const idx = sequence.findIndex((o) => o.kind === kind);
+      if (idx !== -1) return sequence.splice(idx, 1)[0];
+      return { ok: true, stdout: 'ok' };
+    };
+    return { calls, restore: () => { installer.runClaude = orig; } };
+  }
+
+  await test('matrix A: MCP remove failure ABORTS replacement — no add, no rollback, registration preserved', () => {
+    const { home } = setupOwnRegistration();
+    const { calls, restore } = stubRunClaude([{ kind: 'remove', ok: false, stderr: 'simulated remove failure' }]);
+    try {
+      const res = installer.installMcp({ dryRun: false, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+      assert.strictEqual(res.action, 'failed', 'remove failure must fail the replacement');
+      assert.ok(/could not remove the existing registration/.test(res.error), 'error names the removal failure');
+      assert.ok(/simulated remove failure/.test(res.error), 'error carries the underlying cause');
+      assert.strictEqual(calls.filter((c) => c.startsWith('mcp remove')).length, 1, 'exactly one remove attempted');
+      assert.strictEqual(calls.filter((c) => c.startsWith('mcp add')).length, 0, 'NO add after a failed remove');
+      assert.strictEqual(res.rollback, undefined, 'no rollback when the removal itself failed');
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).mcpServers['telegram-bridge'].args, [path.join(libDirRoot(), 'scripts', 'launch-channel.js')], 'existing registration untouched');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('matrix B: remove succeeds, add succeeds -> replaced', () => {
+    const { home } = setupOwnRegistration();
+    const { calls, restore } = stubRunClaude([]); // everything succeeds
+    try {
+      const res = installer.installMcp({ dryRun: false, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+      assert.strictEqual(res.action, 'replaced');
+      assert.strictEqual(res.verified, true);
+      assert.strictEqual(calls.filter((c) => c.startsWith('mcp remove')).length, 1);
+      assert.ok(calls.some((c) => c.startsWith('mcp add')), 'add ran after a successful remove');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('matrix C: remove succeeds, add fails, rollback succeeds -> failed + previous restored', () => {
+    const { home, ours } = setupOwnRegistration();
+    const { calls, restore } = stubRunClaude([
+      { kind: 'add', ok: false, stderr: 'simulated add failure' }, // the replacement add fails
+    ]);
+    try {
+      const res = installer.installMcp({ dryRun: false, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+      assert.strictEqual(res.action, 'failed');
+      assert.strictEqual(res.rollback, 'previous registration restored');
+      assert.strictEqual(calls.filter((c) => c.startsWith('mcp remove')).length, 1, 'remove once');
+      assert.strictEqual(calls.filter((c) => c.startsWith('mcp add')).length, 2, 'replacement add + rollback add');
+      assert.ok(res.error.includes('simulated add failure'));
+      assert.ok(ours, 'sanity');
+    } finally {
+      restore();
+    }
+  });
+
+  await test('matrix D: remove succeeds, add fails, rollback fails -> failed + loud rollback failure', () => {
+    const { home } = setupOwnRegistration();
+    let addCalls = 0;
+    const calls = [];
+    const orig = installer.runClaude;
+    installer.runClaude = (args) => {
+      calls.push(args.slice(0, 2).join(' '));
+      if (args[1] === 'add') {
+        addCalls += 1;
+        return { ok: false, stderr: `add failure #${addCalls}` };
+      }
+      return { ok: true, stdout: 'removed' };
+    };
+    try {
+      const res = installer.installMcp({ dryRun: false, home, nodeExe: 'C:\\Program Files\\nodejs\\node.exe' });
+      assert.strictEqual(res.action, 'failed');
+      assert.ok(/ROLLBACK FAILED/.test(res.rollback), 'rollback failure is loud');
+      assert.ok(/claude mcp add -s user/.test(res.rollback), 'rollback error names the manual command');
+      assert.strictEqual(calls.filter((c) => c.startsWith('mcp add')).length, 2, 'replacement add + attempted rollback add');
+    } finally {
+      installer.runClaude = orig;
+    }
+  });
+
+  console.log('global install: uninstall wrapper discovery across default locations');
+
+  /** Lay out a fake Windows home with managed/unmanaged wrappers. */
+  function setupWrapperScenarios({ localBin = 'none', npmBin = 'none', explicitDir = null } = {}) {
+    const home = tmpDir();
+    const localBinDir = path.join(home, '.local', 'bin');
+    const npmDir = path.join(home, 'AppData', 'Roaming', 'npm');
+    fs.mkdirSync(localBinDir, { recursive: true });
+    fs.mkdirSync(npmDir, { recursive: true });
+    const injectedAppData = path.join(home, 'AppData', 'Roaming');
+    const managed = lib.renderCmd({ lines: ['echo hello'] });
+    const unmanaged = '@echo off\r\necho hand written\r\n';
+    const put = (dir, kind) => {
+      for (const name of lib.WRAPPER_NAMES) {
+        fs.writeFileSync(path.join(dir, name), kind === 'managed' ? managed : unmanaged, 'utf8');
+      }
+    };
+    if (localBin === 'managed') put(localBinDir, 'managed');
+    if (localBin === 'unmanaged') put(localBinDir, 'unmanaged');
+    if (npmBin === 'managed') put(npmDir, 'managed');
+    if (npmBin === 'unmanaged') put(npmDir, 'unmanaged');
+    let explicitDirPath = null;
+    if (explicitDir) {
+      explicitDirPath = path.join(home, 'tools');
+      fs.mkdirSync(explicitDirPath, { recursive: true });
+      put(explicitDirPath, explicitDir);
+    }
+    return { home, localBinDir, npmDir, injectedAppData, explicitDirPath, managed };
+  }
+
+  function runUninstall(home, args = [], { appData = null } = {}) {
+    const realHomedir = os.homedir;
+    const realAppData = process.env.APPDATA;
+    os.homedir = () => home;
+    if (appData !== null) process.env.APPDATA = appData; // uninstall reads the injected env
+    try {
+      const origRun = installer.runClaude;
+      installer.runClaude = () => ({ ok: true, stdout: 'ok' });
+      try {
+        return uninstaller.main(args);
+      } finally {
+        installer.runClaude = origRun;
+      }
+    } finally {
+      os.homedir = realHomedir;
+      if (appData !== null) process.env.APPDATA = realAppData;
+    }
+  }
+
+  await test('uninstall finds managed wrappers in %APPDATA%\\npm when ~/.local/bin is empty (npm-bin fallback install)', () => {
+    const { home, npmDir, localBinDir, injectedAppData } = setupWrapperScenarios({ npmBin: 'managed' });
+    const code = runUninstall(home, ['--json'], { appData: injectedAppData });
+    assert.strictEqual(code, 0);
+    assert.strictEqual(fs.existsSync(path.join(npmDir, lib.CLAUDE_TELEGRAM_CMD)), false, 'npm-fallback wrapper removed');
+    assert.strictEqual(fs.existsSync(path.join(npmDir, lib.BRIDGE_CMD)), false, 'npm-fallback bridge wrapper removed');
+    const removed = fs.readdirSync(npmDir);
+    assert.strictEqual(removed.length, 0, 'nothing else in npm dir touched');
+    assert.strictEqual(fs.readdirSync(localBinDir).length, 0, 'empty ~/.local/bin left empty');
+  });
+
+  await test('uninstall finds managed wrappers in ~/.local/bin (primary default)', () => {
+    const { home, localBinDir, injectedAppData } = setupWrapperScenarios({ localBin: 'managed' });
+    const code = runUninstall(home, ['--json'], { appData: injectedAppData });
+    assert.strictEqual(code, 0);
+    assert.strictEqual(fs.readdirSync(localBinDir).length, 0, 'primary-default wrappers removed');
+  });
+
+  await test('uninstall removes managed wrappers from BOTH known default locations when both exist', () => {
+    const { home, npmDir, localBinDir, injectedAppData } = setupWrapperScenarios({ localBin: 'managed', npmBin: 'managed' });
+    const code = runUninstall(home, ['--json'], { appData: injectedAppData });
+    assert.strictEqual(code, 0);
+    assert.strictEqual(fs.readdirSync(localBinDir).length, 0);
+    assert.strictEqual(fs.readdirSync(npmDir).length, 0);
+  });
+
+  await test('explicit --bin-dir restricts uninstall to exactly that directory', () => {
+    const { home, explicitDirPath, localBinDir, npmDir, injectedAppData } = setupWrapperScenarios({ localBin: 'managed', npmBin: 'managed', explicitDir: 'managed' });
+    const code = runUninstall(home, ['--json', '--bin-dir', explicitDirPath], { appData: injectedAppData });
+    assert.strictEqual(code, 0);
+    assert.strictEqual(fs.readdirSync(explicitDirPath).length, 0, 'explicit-dir wrappers removed');
+    assert.strictEqual(fs.readdirSync(localBinDir).length, 2, 'default locations NOT touched when --bin-dir is explicit');
+    assert.strictEqual(fs.readdirSync(npmDir).length, 2);
+  });
+
+  await test('unmanaged same-name wrappers are never removed, in any scanned location', () => {
+    const { home, localBinDir, npmDir, injectedAppData } = setupWrapperScenarios({ localBin: 'unmanaged', npmBin: 'unmanaged' });
+    const code = runUninstall(home, ['--json'], { appData: injectedAppData });
+    assert.strictEqual(code, 0);
+    assert.strictEqual(fs.readFileSync(path.join(localBinDir, lib.CLAUDE_TELEGRAM_CMD), 'utf8'), '@echo off\r\necho hand written\r\n');
+    assert.strictEqual(fs.readFileSync(path.join(npmDir, lib.BRIDGE_CMD), 'utf8'), '@echo off\r\necho hand written\r\n');
+  });
+
+  await test('uninstall reports where each wrapper was found (path + action)', () => {
+    const { home, npmDir, injectedAppData } = setupWrapperScenarios({ npmBin: 'managed' });
+    let json = '';
+    const realHomedir = os.homedir;
+    const realAppData = process.env.APPDATA;
+    os.homedir = () => home;
+    process.env.APPDATA = injectedAppData;
+    const origRun = installer.runClaude;
+    installer.runClaude = () => ({ ok: true, stdout: 'ok' });
+    const origWrite = process.stdout.write;
+    process.stdout.write = (s) => { json += s; return true; };
+    try {
+      uninstaller.main(['--json']);
+    } finally {
+      process.stdout.write = origWrite;
+      os.homedir = realHomedir;
+      process.env.APPDATA = realAppData;
+      installer.runClaude = origRun;
+    }
+    const parsed = JSON.parse(json);
+    const removed = parsed.wrappers.filter((w) => w.action === 'removed');
+    assert.strictEqual(removed.length, 2, 'both wrappers removed');
+    for (const w of removed) {
+      assert.ok(w.path && w.path.startsWith(npmDir), `report names the discovery location: ${w.path}`);
+      assert.ok(lib.WRAPPER_NAMES.includes(w.name));
+    }
+  });
+
+  console.log('global install: --no-wrappers independence + argument strictness');
+
+  await test('--no-wrappers does not require a bin directory (no PATH candidates at all)', () => {
+    const home = tmpDir();
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: {} }), 'utf8');
+    const realHomedir = os.homedir;
+    const realPrereq = installer.checkPrerequisites;
+    const origRun = installer.runClaude;
+    os.homedir = () => home;
+    installer.checkPrerequisites = () => ({
+      problems: [],
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      claudeLaunch: { command: 'C:\\Program Files\\nodejs\\node.exe', prefixArgs: ['C:\\claude\\cli.js'] },
+    });
+    installer.runClaude = () => ({ ok: true, stdout: 'ok' });
+    let out = '';
+    const origWrite = process.stdout.write;
+    process.stdout.write = (s) => { out += s; return true; };
+    let code;
+    try {
+      // PATH with NO acceptable wrapper directory — must not matter for --no-wrappers.
+      process.env.PATH = 'C:\\definitely\\not\\a\\wrapper\\dir';
+      try {
+        code = installer.main(['--json', '--no-wrappers']);
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      assert.strictEqual(code, 0, 'MCP-only install succeeds with no bin dir available');
+      const parsed = JSON.parse(out);
+      assert.strictEqual(parsed.wrappers.action, 'skipped');
+      assert.strictEqual(parsed.mcp.action, 'added');
+      assert.strictEqual(parsed.binDir, null, 'no bin dir resolved or required');
+    } finally {
+      os.homedir = realHomedir;
+      installer.checkPrerequisites = realPrereq;
+      installer.runClaude = origRun;
+    }
+  });
+
+  await test('install-global rejects stray positional arguments', () => {
+    assert.throws(() => installer.parseArgs(['nonsense']), /unexpected positional argument: nonsense/);
+    assert.throws(() => installer.parseArgs(['--dry-run', 'junk']), /unexpected positional argument: junk/);
+  });
+
   await test('installMcp plans a rollback of the previous registration when add fails (non-dry-run, stubbed runClaude)', () => {
     const home = tmpDir();
     const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');

@@ -144,6 +144,20 @@ function resolveBinDir({ env = process.env, platform = process.platform, home = 
   };
 }
 
+/**
+ * The installer's KNOWN default wrapper locations, in preference order:
+ * ~/.local/bin first, then the npm global bin directory when it can be
+ * determined. Used by uninstall to find wrappers no matter which candidate
+ * install chose — deliberately independent of the user's CURRENT PATH (which
+ * may have changed since installation and must never become a deletion
+ * surface). Only ownership-marked files are ever removed from these dirs.
+ */
+function defaultWrapperDirs({ env = process.env, home = os.homedir(), platform = process.platform } = {}) {
+  const dirs = [path.join(home, '.local', 'bin')];
+  if (platform === 'win32' && env.APPDATA) dirs.push(path.join(env.APPDATA, 'npm'));
+  return dirs;
+}
+
 // ---------------------------------------------------------------------------
 // Wrapper file generation
 // ---------------------------------------------------------------------------
@@ -268,6 +282,7 @@ module.exports = {
   BRIDGE_CMD,
   WRAPPER_NAMES,
   defaultBinDir,
+  defaultWrapperDirs,
   isDirectoryOnPath,
   resolveBinDir,
   renderCmd,

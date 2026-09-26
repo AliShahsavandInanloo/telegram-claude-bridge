@@ -73,6 +73,7 @@ function parseArgs(argv) {
     }
     else if (a.startsWith('--bin-dir=')) opts.binDir = a.slice('--bin-dir='.length);
     else if (a.startsWith('--')) throw new Error(`unknown option: ${a}`);
+    else throw new Error(`unexpected positional argument: ${a}`);
   }
   return opts;
 }
@@ -196,7 +197,19 @@ function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node', claudeLaunc
 
   // Remove first so re-running never creates a duplicate entry.
   // (Called via module.exports so tests can stub the subprocess runner.)
-  if (before.present) module.exports.runClaude(buildMcpRemoveArgs(), claudeLaunch);
+  // The removal result is CHECKED: if it fails, abort immediately — the old
+  // registration should still exist, so no rollback is needed and no new
+  // `mcp add` may run (a failed removal followed by an add could leave a
+  // duplicate or a half-replaced registration while reporting "replaced").
+  if (before.present) {
+    const removed = module.exports.runClaude(buildMcpRemoveArgs(), claudeLaunch);
+    if (!removed.ok) {
+      return {
+        action: 'failed',
+        error: `could not remove the existing registration before replacing it: ${removed.stderr || removed.stdout || 'claude mcp remove failed'}`,
+      };
+    }
+  }
   const added = module.exports.runClaude(addArgs, claudeLaunch);
   if (!added.ok) {
     let rollback = null;
@@ -256,7 +269,8 @@ function main(argv = process.argv.slice(2)) {
   }
 
   const log = opts.json ? () => {} : (m) => process.stdout.write(`${m}\n`);
-  const { problems, nodeExe, claudeLaunch } = checkPrerequisites();
+  // Routed through module.exports so tests can stub prerequisite discovery.
+  const { problems, nodeExe, claudeLaunch } = module.exports.checkPrerequisites();
   const secret = secretStatus();
 
   if (problems.length) {
@@ -267,24 +281,31 @@ function main(argv = process.argv.slice(2)) {
   // WHERE do the wrappers go? The bin directory is verified against PATH —
   // never assumed. Default falls back to the npm global bin dir; an explicit
   // --bin-dir is honored but warned about when it is not on PATH.
-  const bin = resolveBinDir({ env: process.env, platform: process.platform, explicit: opts.binDir });
-  if (bin.error) {
+  // NOTE: with --no-wrappers there is nothing to place, so no bin directory
+  // is required, validated, or reported — a machine with no suitable PATH
+  // directory can still install the MCP cleanly.
+  const bin = opts.noWrappers
+    ? null
+    : resolveBinDir({ env: process.env, platform: process.platform, explicit: opts.binDir });
+  if (bin && bin.error) {
     process.stderr.write(`error: ${bin.error}\n`);
     return 1;
   }
-  const binDir = bin.dir;
+  const binDir = bin ? bin.dir : null;
 
   log(`telegram-bridge — global install${opts.dryRun ? ' (dry run)' : ''}`);
   log(`  bridge root : ${ROOT}`);
   log(`  launcher    : ${LAUNCHER}`);
   log(`  node        : ${nodeExe}`);
   log(`  claude      : ${claudeLaunch.command}${claudeLaunch.prefixArgs.length ? ' ' + claudeLaunch.prefixArgs.join(' ') : ''}`);
-  log(`  bin dir     : ${binDir}${bin.onPath ? '' : '  (WARNING: not on PATH — commands will not resolve globally)'}`);
-  if (bin.note) log(`  note        : ${bin.note}`);
+  if (bin) {
+    log(`  bin dir     : ${binDir}${bin.onPath ? '' : '  (WARNING: not on PATH — commands will not resolve globally)'}`);
+    if (bin.note) log(`  note        : ${bin.note}`);
+  }
   log(`  secret      : ${secret.path} (${secret.present ? `ok, ${secret.length} chars` : 'NOT FOUND'})`);
   log('');
 
-  const result = { root: ROOT, launcher: LAUNCHER, binDir, binOnPath: bin.onPath, dryRun: opts.dryRun, secret: { path: secret.path, present: secret.present, length: secret.length } };
+  const result = { root: ROOT, launcher: LAUNCHER, binDir, binOnPath: bin ? bin.onPath : null, dryRun: opts.dryRun, secret: { path: secret.path, present: secret.present, length: secret.length } };
   let exitCode = 0;
 
   if (opts.noMcp) {
@@ -321,7 +342,7 @@ function main(argv = process.argv.slice(2)) {
       result.wrappers.action = opts.dryRun ? 'planned' : 'installed';
     }
   }
-  if (!bin.onPath && exitCode === 0) {
+  if (bin && !bin.onPath && exitCode === 0) {
     log(`  WARNING: ${binDir} is not on PATH — telegram-claude-bridge / claude-telegram will not resolve globally.`);
     exitCode = 1;
   }

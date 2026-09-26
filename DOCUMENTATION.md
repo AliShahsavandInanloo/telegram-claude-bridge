@@ -2,7 +2,7 @@
 
 A self-hosted bridge that lets you drive a local **Claude Code** harness from
 **Telegram**. You send tasks to **your own bot** (any name registered with
-@BotFather); each message becomes the prompt for `claude -p` on this machine,
+@BotFather); each message becomes the prompt for `claude -p` on your computer,
 and the final report is delivered back to your chat.
 
 Built for **censored networks** (countries where Telegram is blocked): all bot
@@ -35,7 +35,7 @@ endpoint is hard-coded** — the route is auto-detected at runtime.
 ```
 ┌───────────┐  HTTPS long polling    ┌─────────────────┐  spawn (no shell) ┌──────────────┐
 │  Telegram │ ─────────────────────► │  bridge.js      │ ─────────────────► │ claude -p    │
-│  cloud    │ ◄───────────────────── │  (this machine) │ ◄───────────────── │ (session)    │
+│  cloud    │ ◄───────────────────── │  (your computer) │ ◄───────────────── │ (session)    │
 └───────────┘  reports back as chat  └─────────────────┘  stdout (bounded) └──────────────┘
         │                                    │                              │
         ▼                                    ▼                              ▼
@@ -133,7 +133,7 @@ without them**:
 2. **`ALLOWED_TELEGRAM_IDS`** — your numeric Telegram user ID(s), comma-separated
    (get them from @userinfobot). There is no open-access mode: an empty or
    missing allowlist is a startup error, because Claude runs with broad
-   permissions on this machine (see [Security](#10-security-model)).
+   permissions on your computer (see [Security](#10-security-model)).
 
 ---
 
@@ -303,7 +303,7 @@ Consequences:
 
 Because Claude runs with `--dangerously-skip-permissions`, the Telegram
 allowlist is the security boundary: treat it like giving those people shell
-access to this machine. To revoke access, remove the ID from `.env` and restart.
+access to your computer. To revoke access, remove the ID from `.env` and restart.
 
 ---
 
@@ -420,8 +420,11 @@ id); and `/status` path privacy.
 | Symptom | Cause → fix |
 |---|---|
 | `refusing to start: ALLOWED_TELEGRAM_IDS …` | set your numeric ID(s) in `.env` (required) |
+| `EADDRINUSE 127.0.0.1:<port>` | Channel port already in use → find the owner (`netstat -ano \| findstr :<port>`) and stop it, or set another `CLAUDE_CHANNEL_PORT` |
+| Telegram `getUpdates` conflict errors | another process is polling the same bot token → stop it; only ONE Telegram poller may use a token |
+| Channel session never appears in `/sessions` | the Bridge must be running, and Claude must be started with `claude-telegram` (plain `claude` has no Channel) |
 | `cannot reach Telegram yet` repeats | VPN off/broken → start it; the bridge self-recovers. Or pin `TELEGRAM_PROXY_URL`. |
-| `Telegram getMe failed: 401` | wrong token in `.env` → re-copy from @BotFather |
+| `Telegram getMe failed: 401` | wrong token in `.env` → re-copy from @BotFather (this is authentication, not a Channel-port problem) |
 | `refusing to start: CLAUDE_BIN …` | path doesn't exist or isn't executable |
 | `refusing to start: TELEGRAM_PROXY_URL …` | invalid proxy URL syntax |
 | Bot silent to a user | that user is not in `ALLOWED_TELEGRAM_IDS` (by design) |
@@ -430,6 +433,7 @@ id); and `/status` path privacy.
 | `_(stdout truncated …)_` in reports | output exceeded `MAX_STDOUT_BYTES`; raise it if needed |
 | Reply shows raw `*text*` | Markdown fallback kicked in — cosmetic only |
 | 429 / flood warnings | sending too fast; the bridge honors `retry_after` automatically |
+| Global MCP missing/stale | `claude mcp get telegram-bridge` → verify user scope + connected; re-run `npm run install-global` if needed |
 
 Diagnostics cheat sheet:
 
@@ -459,9 +463,9 @@ are two managed transports plus two non-attachable views:
 | Type | transport | Attachable | How it runs |
 |---|---|---|---|
 | **Channel session** | `channel` | yes, when connected | A real Claude Code session with the custom channel enabled; Telegram messages appear natively in the live conversation |
-| **stream-json session** | `stream-json` | yes (queued tasks) | A headless Claude process the bridge spawns and owns; legacy/automation transport |
-| Discovered process | — | **no** | `/discover` inventory of foreign Claude processes; never touched |
-| Legacy one-shot | — | n/a | `claude -p` per message via the classic store |
+| **Stream session** | `stream-json` | yes (queued tasks) | A headless Claude process the bridge spawns and owns; for background/automation use |
+| Discovered process | — | **no** | `/discover` inventory of other Claude processes; never touched |
+| One-shot | — | n/a | `claude -p` per message via the classic store |
 
 ### Channel sessions (native Claude Code integration)
 
@@ -552,11 +556,11 @@ session goes offline. Zombie sockets can never dispatch tools.
 **Delivery-scoped replies (delayed reply after /switch):** every Telegram
 message routed to a Channel session creates a delivery record and passes
 `delivery_id` in the `<channel>` meta. The `reply`/`send_file` tools resolve
-that id to the ORIGINAL chat, so NDS can finish answering after you've
-`/switch`ed to OmniRoute. Rules: only the session that owns the delivery may
+that id to the ORIGINAL chat, so ProjectA can finish answering after you've
+`/switch`ed to ProjectB. Rules: only the session that owns the delivery may
 use it; unknown/expired (6 h TTL) deliveries are rejected; no channel can
-name an arbitrary chat. The legacy `reply(chat_id, …)` form still works only
-while the session is the chat's CURRENT attachment and is deprecated.
+name an arbitrary chat. The deprecated `reply(chat_id, …)` fallback still works only
+while the session is the chat's CURRENT attachment; prefer `delivery_id`.
 Deliveries are PERSISTED in `state/deliveries.json` (atomic writes, bounded
 to 1000 records, expired records purged on load and insert; only routing
 metadata is stored — never message text), so a `delivery_id` still resolves
@@ -629,7 +633,7 @@ persistence than that.
 Channel identity is the persisted `clientId` on the registry
 record (primary reconnect key; name/project are metadata), so multiple
 Claude sessions on the same project keep distinct identities across Bridge
-restarts; legacy records without a clientId are backfilled on first
+restarts; older records without a clientId are backfilled on first
 registration. Channel state machine: `disconnected → connecting →
 authenticated → registering → registered`; disconnect from any state
 returns to `disconnected`; only `registered` is usable (`link.isUsable()` /
@@ -732,8 +736,12 @@ per-project mode above keeps working unchanged.
 **Maintenance:**
 
 ```cmd
-npm run install-global      # idempotent: replaces our own entry, never duplicates
-npm run uninstall-global    # removes only what this installer created
+npm run install-global                # idempotent: replaces its own entry, never duplicates
+npm run uninstall-global              # scans the known default wrapper locations
+npm run uninstall-global -- --force   # also remove a foreign "telegram-bridge" MCP registration
+npm run uninstall-global -- --bin-dir "D:\\tools"   # inspect ONLY this directory
+npm run install-global -- --no-wrappers    # MCP registration only, no wrapper commands needed
+npm run install-global -- --no-mcp         # wrapper commands only
 ```
 
 `install-global` refuses to overwrite a user-scope server named
@@ -746,11 +754,22 @@ uninstall alike (`--force` retains its documented override on uninstall).
 Uninstall deletes a wrapper only when it carries this installer's marker, and
 never touches `.env`, `state/`, or `node_modules/`.
 
+**Uninstall wrapper discovery.** Without an explicit `--bin-dir`, uninstall
+scans the installer's known default locations (`~/.local/bin` **and** the npm
+global bin directory `%APPDATA%\npm` on Windows) and removes every
+ownership-marked wrapper it finds — so wrappers installed via the npm-bin
+fallback are found even if PATH later changed. It deliberately does NOT scan
+arbitrary PATH directories. With an explicit `--bin-dir`, exactly that
+directory is inspected and no other. Same-name files without the ownership
+marker are never removed.
+
 **Executable pinning.** The MCP registration and the Bridge wrapper use the
 **absolute Node executable** resolved at install time (e.g.
 `C:\Program Files\nodejs\node.exe`), so they keep working regardless of which
-PATH Claude Code or the invoking shell inherits. If replacing an existing own
-registration fails after the old entry was removed, the installer attempts to
+PATH Claude Code or the invoking shell inherits. Replacement is fail-safe at
+both steps: if removing the existing own registration fails, the replacement
+**aborts** (no new registration is attempted, the old one is preserved); if the
+new registration fails after a successful removal, the installer attempts to
 restore the previous registration and reports the rollback result.
 
 **Claude launch resolution.** The installer resolves Claude with the Bridge's
@@ -786,7 +805,7 @@ claude mcp get telegram-bridge     # Scope: User config … Status: ✔ Connecte
 node <bridge>\scripts\launch-channel.js --selftest
 ```
 
-### Legacy stream-json managed sessions
+### Stream (managed) sessions
 
 `/new <name> <project-path>` (without a running channel) spawns a headless
 Claude via `--output-format stream-json --input-format stream-json`: tasks

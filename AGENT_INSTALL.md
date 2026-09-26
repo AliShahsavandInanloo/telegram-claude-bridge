@@ -72,7 +72,7 @@ The required user-specific values are:
 - `TELEGRAM_BOT_TOKEN` — the token issued by Telegram BotFather
 - `ALLOWED_TELEGRAM_IDS` — the Telegram numeric user ID(s) permitted to control
   the Bridge (get yours from @userinfobot). The Bridge refuses to start without
-  this, because every job runs Claude with full access to this machine.
+  this, because every job runs Claude with full access to the target computer.
 
 If these values are missing, tell the user exactly what is needed.
 
