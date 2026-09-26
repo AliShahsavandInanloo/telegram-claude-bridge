@@ -115,7 +115,10 @@ the same registry record (keyed by its persisted clientId). Registration is
 atomic and serialized: registry transactions are GLOBALLY isolated (one
 whole-registry snapshot/mutate/persist/rollback cycle at a time, so a
 failed registration for one session can never corrupt another's committed
-record), same-client connection ordering stays per session, a session
+record) — and the Claude session manager (create / attach / detach / status)
+acquires this same lock BEFORE it snapshots, mutates or saves, so its
+operations can never be erased by a concurrent rollback — same-client
+connection ordering stays per session, a session
 becomes routable only after its registry record is durably persisted, a
 failed persist or a superseded candidate rolls back cleanly and retries
 with backoff (rejected attempts leave no staged metadata behind), a

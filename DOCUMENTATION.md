@@ -573,9 +573,17 @@ offline.
 
 **Registry transaction isolation:** snapshot/restore operate on the ENTIRE
 registry, so every whole-registry transactional flow — the hub's
-registration transaction AND the manager's debounced persists (create,
-attach, detach) — runs inside a GLOBAL registry transaction mutex
-(`reg.withTransaction`). Only one full-registry
+registration transaction AND the manager's persists (create, attach,
+detach, status, session id) — runs inside the SAME GLOBAL registry
+transaction mutex (`reg.withTransaction`). One rule: all persisted registry
+mutations, Channel and manager alike, execute inside the same global
+registry transaction boundary. The manager acquires the lock BEFORE it
+snapshots, mutates or saves (never lock-only-around-save), so its operations
+cannot be erased by a concurrent whole-registry rollback. High-frequency,
+low-value fields (session `status`, `claudeSessionId`, `lastActivity`) are
+queued OUTSIDE the registry and applied — with a single save — inside ONE
+registry transaction per burst; the live registry is never mutated before
+the lock is held. Only one full-registry
 snapshot → mutate → persist → commit/restore cycle may run at a time, so a
 failed registration for client X can never roll back a successfully
 committed transaction for client Y, and a superseded candidate restores its

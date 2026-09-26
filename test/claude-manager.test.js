@@ -226,9 +226,9 @@ const LAUNCH = { command: 'claude.exe', prefixArgs: [] };
       },
       saveDelayMs: 5,
     });
-    const created = mgr.createSession({ name: 'work', project: proj, owner: { userId: '1' } });
+    const created = await mgr.createSession({ name: 'work', project: proj, owner: { userId: '1' } });
     assert.ok(created.ok, created.error);
-    const att = mgr.attach('77', created.entry.id);
+    const att = await mgr.attach('77', created.entry.id);
     assert.ok(att.ok);
     const routed = mgr.route('77', 'task one');
     assert.strictEqual(children.length, 1, 'process spawned lazily on route');

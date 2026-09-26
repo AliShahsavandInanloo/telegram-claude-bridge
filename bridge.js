@@ -900,12 +900,12 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
       const name = isManaged ? parts.slice(0, -1).join(' ') : arg;
 
       if (isManaged) {
-        const created = claudeManager.createSession({ name, project: maybePath, owner: { userId: String(userId || '') } });
+        const created = await claudeManager.createSession({ name, project: maybePath, owner: { userId: String(userId || '') } });
         if (!created.ok) {
           await reply(chatId, `❌ ${created.error}`);
           return;
         }
-        claudeManager.attach(chatId, created.entry.id);
+        await claudeManager.attach(chatId, created.entry.id);
         await reply(chatId, `✨ Managed session *${created.entry.name}* created for project ${projectLabel(created.entry.project)} and attached.\nSend any text to task it; /detach to release; /session-status for details.`);
         return;
       }
@@ -973,7 +973,7 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
         await reply(chatId, `⚠️ *${target.name}* is offline right now. Start Claude Code in that project with the channel enabled, then /switch again.\nNot switching to a different session.`);
         return;
       }
-      const r = claudeManager.attach(chatId, target.id);
+      const r = await claudeManager.attach(chatId, target.id);
       if (!r.ok) {
         await reply(chatId, `❌ ${r.error}`);
         return;
@@ -1074,7 +1074,7 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
         await reply(chatId, `⚠️ *${target.name}* is a Channel session but is currently OFFLINE.\nStart Claude Code in that project with the channel enabled, then try again.\n(Not falling back to another session.)`);
         return;
       }
-      const r = claudeManager.attach(chatId, target.id);
+      const r = await claudeManager.attach(chatId, target.id);
       if (!r.ok) {
         await reply(chatId, `❌ ${r.error}`);
         return;
@@ -1084,7 +1084,7 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
     }
 
     case 'detach': {
-      const d = claudeManager.detach(chatId);
+      const d = await claudeManager.detach(chatId);
       await reply(chatId, d.wasAttached ? '🔌 Detached. Plain text now uses the classic one-shot flow (/new <name>).' : 'Nothing to detach from.');
       return;
     }

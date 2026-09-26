@@ -412,8 +412,8 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
     // and the same through the manager:
     const mgr = createClaudeManager({ reg, launch: { command: 'x', prefixArgs: [] }, spawnFn: () => ({ pid: 1, exitCode: null, on: () => {}, stdin: { write: () => {}, on: () => {} }, stdout: { on: () => {} }, stderr: { on: () => {} }, kill() {} }), saveDelayMs: 5 });
     fail = true;
-    await mgr.attach('1', b.id); // withPersist: snapshot->mutate->save-fail->restore
-    await new Promise((r2) => setTimeout(r2, 30));
+    const res = await mgr.attach('1', b.id); // withPersist: lock->snapshot->mutate->save-fail->restore
+    assert.strictEqual(res.ok, false, 'manager never reports success when the save failed');
     assert.strictEqual(reg.attached('1').id, a.id, 'manager withPersist restores exactly the previous state');
     reg.save = origSave;
     mgr.stopAll();
@@ -434,9 +434,8 @@ function registerConn(hub, reg, { clientId, project, projectName, claudeSessionI
       spawnFn: () => ({ pid: 1, exitCode: null, on: () => {}, stdin: { write: () => {}, on: () => {} }, stdout: { on: () => {} }, stderr: { on: () => {} }, kill() {} }),
       saveDelayMs: 5,
     });
-    const created = mgr.createSession({ name: 'fresh', project: proj });
-    assert.ok(created.ok, 'mutation applied');
-    await new Promise((r) => setTimeout(r, 30)); // wait for the failed persist + rollback
+    const created = await mgr.createSession({ name: 'fresh', project: proj });
+    assert.strictEqual(created.ok, false, 'creation reports failure — never false success');
     assert.ok(reg.getByName('keep'), 'pre-existing session survives');
     assert.strictEqual(reg.getByName('fresh'), null, 'new session rolled back on failed save');
     reg.save = origSave;

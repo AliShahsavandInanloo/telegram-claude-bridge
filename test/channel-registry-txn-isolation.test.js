@@ -50,6 +50,7 @@ const test = (function () {
 
 const { createChannelHub } = require('../lib/channel/hub');
 const { createRegistry } = require('../lib/claude/registry');
+const { createClaudeManager } = require('../lib/claude/manager');
 
 const SECRET = crypto.randomBytes(32).toString('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -567,6 +568,320 @@ test('stress: 10 identities, same-client replacements, mixed save outcomes — c
   assert.strictEqual(registrationLockCount(hub), 0, 'registration lock map cleaned');
   assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
   hub.close();
+});
+
+// ---------------------------------------------------------------------------
+// 3. MANAGER registry transaction boundaries (final consistency pass)
+//
+// The manager must own the SAME global registry transaction as the Channel
+// hub: lock -> snapshot -> mutate -> save -> restore-on-failure. Nothing may
+// mutate the shared registry (or take a whole-registry snapshot) outside it.
+// ---------------------------------------------------------------------------
+
+const LAUNCH = { command: 'claude.exe', prefixArgs: [] };
+
+function fakeChild() {
+  const handlers = {};
+  return {
+    pid: 9000,
+    exitCode: null,
+    signalCode: null,
+    stdin: { write: () => {}, on: () => {} },
+    stdout: { on: () => {} },
+    stderr: { on: () => {} },
+    on: (ev, fn) => {
+      (handlers[ev] = handlers[ev] || []).push(fn);
+    },
+    kill() {
+      (handlers.close || []).forEach((f) => f(0, null));
+    },
+  };
+}
+
+/** Real manager over a real temp registry; debounce disabled (explicit flush only). */
+function makeManager(reg, saveDelayMs = 100000) {
+  return createClaudeManager({ reg, launch: LAUNCH, spawnFn: () => fakeChild(), logInfo: () => {}, logError: () => {}, saveDelayMs });
+}
+
+/** Hold the global registry transaction until release() is called. */
+function holdTransaction(reg) {
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  const done = reg.withTransaction(async () => {
+    await gate;
+  });
+  return { release, done };
+}
+
+function makeProject(dir) {
+  const proj = path.join(dir, 'proj');
+  fs.mkdirSync(proj);
+  return proj;
+}
+
+test('manager attach waits behind a held registry transaction, then commits durably', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  const held = holdTransaction(reg);
+  assert.strictEqual(reg.transactionBusy(), true, 'registry lock held');
+  let settled = false;
+  const p = mgr.attach('77', a.id).then((r) => {
+    settled = true;
+    return r;
+  });
+  await sleep(15);
+  assert.strictEqual(settled, false, 'attach must NOT return success while the lock is held');
+  assert.strictEqual(reg.attached('77'), null, 'no mutation before the transaction is owned');
+
+  held.release();
+  await held.done;
+  const r = await p;
+  assert.ok(r.ok, 'attach succeeds after release');
+  assert.strictEqual(reg.attached('77').id, a.id, 'attachment durable');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('repro: a transaction that snapshots then restores cannot erase a later manager attach', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  // Transaction X takes an OLD whole-registry snapshot (no attachment), waits,
+  // then late-restores it. Before the fix the manager mutated outside the lock
+  // and returned success, so X's rollback silently erased the attachment.
+  const oldTx = reg.withTransaction(async () => {
+    const snap = reg.snapshot();
+    await gate;
+    reg.restore(snap);
+  });
+
+  const p = mgr.attach('5', a.id);
+  await sleep(15);
+  assert.strictEqual(reg.attached('5'), null, 'attach blocked until the old transaction releases');
+
+  release();
+  await oldTx;
+  const r = await p;
+  assert.ok(r.ok, 'attach reports success only after its own commit');
+  assert.strictEqual(reg.attached('5').id, a.id, 'attachment survives the unrelated late rollback');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager createSession waits behind a held registry transaction, then commits', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  const held = holdTransaction(reg);
+  let settled = false;
+  const p = mgr.createSession({ name: 'fresh', project: proj }).then((r) => {
+    settled = true;
+    return r;
+  });
+  await sleep(15);
+  assert.strictEqual(settled, false, 'create must wait for the registry transaction');
+  assert.strictEqual(reg.getByName('fresh'), null, 'registry unchanged while the lock is held');
+
+  held.release();
+  await held.done;
+  const created = await p;
+  assert.ok(created.ok, 'create succeeded after release');
+  assert.ok(reg.getByName('fresh'), 'session remains present after its commit');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+  mgr.stopAll();
+});
+
+test('manager detach waits behind a held registry transaction, then commits', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  reg.attach('9', a.id);
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  const held = holdTransaction(reg);
+  let settled = false;
+  const p = mgr.detach('9').then((r) => {
+    settled = true;
+    return r;
+  });
+  await sleep(15);
+  assert.strictEqual(settled, false, 'detach must wait for the registry transaction');
+  assert.ok(reg.attached('9'), 'attachment unchanged while the lock is held');
+
+  held.release();
+  await held.done;
+  const d = await p;
+  assert.ok(d.ok && d.wasAttached === true, 'detach committed');
+  assert.strictEqual(reg.attached('9'), null, 'detach durable');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager attach save failure restores the exact previous attachment and reports failure', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  const b = reg.create({ name: 'beta', project: proj }).entry;
+  reg.attach('1', a.id);
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  const p = mgr.attach('1', b.id);
+  await sleep(5);
+  assert.strictEqual(ctl.deferreds.length, 1, 'save reached inside the manager transaction');
+  ctl.deferreds[0].reject(new Error('disk gone'));
+  const r = await p;
+  assert.strictEqual(r.ok, false, 'manager never reports success when the save failed');
+  assert.strictEqual(reg.attached('1').id, a.id, 'previous attachment restored exactly');
+  reg.save = origSave;
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager status update is queued, then applied + persisted inside one registry transaction', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const proj = makeProject(dir);
+  const e = reg.create({ name: 'statusy', project: proj }).entry;
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  mgr.stopSession(e.id); // queues status 'stopped'
+  assert.strictEqual(reg.get(e.id).status, 'idle', 'live registry untouched before the transaction');
+
+  const held = holdTransaction(reg);
+  let flushed = false;
+  const flush = mgr._persistNow().then(() => {
+    flushed = true;
+  });
+  await sleep(15);
+  assert.strictEqual(flushed, false, 'status flush waits for the registry transaction');
+  assert.strictEqual(reg.get(e.id).status, 'idle', 'status not mutated while the lock is held');
+
+  held.release();
+  await held.done;
+  await flush;
+  assert.strictEqual(reg.get(e.id).status, 'stopped', 'status applied inside the transaction');
+  const reread = createRegistry(file);
+  assert.strictEqual(reread.get(e.id).status, 'stopped', 'status persisted');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager status save failure restores the previous status', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const e = reg.create({ name: 'statusy', project: proj }).entry;
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  mgr.stopSession(e.id);
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  const flush = mgr._persistNow();
+  await sleep(5);
+  assert.strictEqual(ctl.deferreds.length, 1, 'queued status save reached');
+  ctl.deferreds[0].reject(new Error('disk gone'));
+  await flush;
+  assert.strictEqual(reg.get(e.id).status, 'idle', 'previous status restored exactly');
+  reg.save = origSave;
+  await sleep(10);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('failure of an unrelated transaction cannot erase a manager mutation committed after its snapshot', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const mgr = makeManager(reg);
+  const att = await mgr.attach('2', a.id);
+  assert.ok(att.ok, 'manager attachment committed first');
+
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  const tx = reg.withTransaction(async () => {
+    const snap = reg.snapshot();
+    try {
+      reg.create({ name: 'temp', project: proj });
+      await reg.save();
+    } catch (err) {
+      reg.restore(snap);
+    }
+  });
+  await sleep(5);
+  ctl.deferreds[0].reject(new Error('boom'));
+  await tx;
+  assert.strictEqual(reg.attached('2').id, a.id, 'committed manager attachment survives the unrelated failure');
+  assert.strictEqual(reg.getByName('temp'), null, 'failed transaction left nothing behind');
+  reg.save = origSave;
+  await sleep(10);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('registry touch applies lastActivity inside a transaction, never outside', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const e = reg.create({ name: 'touchy', project: proj }).entry;
+  reg.get(e.id).lastActivity = '1970-01-01T00:00:00.000Z';
+  await reg.save();
+
+  const held = holdTransaction(reg);
+  reg.touch(e.id);
+  const flush = reg.flushTouches();
+  await sleep(10);
+  assert.strictEqual(reg.get(e.id).lastActivity, '1970-01-01T00:00:00.000Z', 'no live mutation while the lock is held');
+
+  held.release();
+  await held.done;
+  await flush;
+  assert.notStrictEqual(reg.get(e.id).lastActivity, '1970-01-01T00:00:00.000Z', 'lastActivity applied inside the transaction');
+  await sleep(10);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('manager create/attach/detach/route complete normally under the new transaction structure (no deadlock)', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  await reg.save();
+  const mgr = makeManager(reg);
+
+  const created = await mgr.createSession({ name: 'one', project: proj });
+  assert.ok(created.ok, created.error);
+  const att = await mgr.attach('3', created.entry.id);
+  assert.ok(att.ok, 'attach completes');
+  assert.strictEqual(reg.attached('3').id, created.entry.id);
+  const det = await mgr.detach('3');
+  assert.ok(det.ok && det.wasAttached === true, 'detach completes');
+  assert.strictEqual(reg.attached('3'), null);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+  mgr.stopAll();
 });
 
 // ---------------------------------------------------------------------------
