@@ -1081,6 +1081,177 @@ async function main() {
     assert.throws(() => installer.parseArgs(['--dry-run', 'junk']), /unexpected positional argument: junk/);
   });
 
+  // ------------------------------------------------------------------------
+  // Cross-platform support: POSIX wrappers, per-platform names, executable
+  // mode, Unix PATH semantics. Windows behavior is re-verified after.
+  // ------------------------------------------------------------------------
+
+  console.log('global install: cross-platform wrapper generation');
+
+  await test('linux wrapperContents produces executable sh scripts without .cmd names', () => {
+    const files = lib.wrapperContents({
+      root: '/home/user/telegram-claude-bridge',
+      claudeLaunch: { command: '/usr/local/bin/claude', prefixArgs: [] },
+      nodeExe: '/usr/bin/node',
+      platform: 'linux',
+    });
+    assert.deepStrictEqual(Object.keys(files).sort(), [lib.CLAUDE_TELEGRAM_SH, lib.BRIDGE_SH].sort());
+    const claude = files[lib.CLAUDE_TELEGRAM_SH];
+    const bridge = files[lib.BRIDGE_SH];
+    assert.ok(claude.startsWith('#!/usr/bin/env sh'), 'claude wrapper has a sh shebang');
+    assert.ok(bridge.startsWith('#!/usr/bin/env sh'), 'bridge wrapper has a sh shebang');
+    assert.ok(claude.includes(lib.MARKER) && bridge.includes(lib.MARKER), 'ownership marker present');
+    assert.ok(claude.includes("'/usr/local/bin/claude' --dangerously-load-development-channels server:telegram-bridge \"$@\""), 'claude invocation uses the launch spec + "$@" passthrough');
+    assert.ok(bridge.includes("cd '/home/user/telegram-claude-bridge'"), 'bridge wrapper cds to the install root');
+    assert.ok(bridge.includes("'/usr/bin/node' '/home/user/telegram-claude-bridge/bridge.js' \"$@\""), 'node pinned for the bridge wrapper');
+    assert.ok(!/%\*/.test(claude + bridge), 'no Windows %* passthrough in POSIX wrappers');
+  });
+
+  await test('darwin wrapperContents equals the linux shape (same POSIX family)', () => {
+    const lin = lib.wrapperContents({ root: '/Users/u/b', claudeLaunch: { command: '/usr/local/bin/claude', prefixArgs: [] }, nodeExe: '/opt/node/bin/node', platform: 'linux' });
+    const mac = lib.wrapperContents({ root: '/Users/u/b', claudeLaunch: { command: '/usr/local/bin/claude', prefixArgs: [] }, nodeExe: '/opt/node/bin/node', platform: 'darwin' });
+    assert.deepStrictEqual(mac, lin, 'darwin and linux wrappers are identical POSIX scripts');
+  });
+
+  await test('windows wrapperContents is unchanged (.cmd names, %* passthrough)', () => {
+    const files = lib.wrapperContents({ root: 'C:\\bridge', claudeLaunch: { command: 'C:\\bin\\claude.exe', prefixArgs: [] }, nodeExe: 'C:\\node\\node.exe', platform: 'win32' });
+    assert.deepStrictEqual(Object.keys(files).sort(), [lib.CLAUDE_TELEGRAM_CMD, lib.BRIDGE_CMD].sort());
+    assert.ok(files[lib.CLAUDE_TELEGRAM_CMD].includes('%*'), 'Windows passthrough preserved');
+    assert.ok(!files[lib.CLAUDE_TELEGRAM_CMD].startsWith('#!'), 'no shebang in .cmd wrappers');
+  });
+
+  await test('quoteSh single-quotes and escapes embedded quotes (no expansion)', () => {
+    assert.strictEqual(lib.quoteSh("/opt/my tool/claude"), "'/opt/my tool/claude'");
+    assert.strictEqual(lib.quoteSh("/o'brien/claude"), "'/o'\\''brien/claude'");
+    assert.strictEqual(lib.quoteSh('/simple/path'), "'/simple/path'");
+  });
+
+  await test('wrapperNamesFor: win32 -> .cmd names, linux/darwin -> POSIX names', () => {
+    assert.deepStrictEqual(lib.wrapperNamesFor('win32'), [lib.CLAUDE_TELEGRAM_CMD, lib.BRIDGE_CMD]);
+    assert.deepStrictEqual(lib.wrapperNamesFor('linux'), [lib.CLAUDE_TELEGRAM_SH, lib.BRIDGE_SH]);
+    assert.deepStrictEqual(lib.wrapperNamesFor('darwin'), [lib.CLAUDE_TELEGRAM_SH, lib.BRIDGE_SH]);
+  });
+
+  const chmodReportsPosixMode = (() => {
+    if (process.platform === 'win32') return false; // NTFS via Node does not store POSIX x-bits
+    const probe = path.join(tmpDir(), 'probe.sh');
+    fs.writeFileSync(probe, 'x', { mode: 0o755 });
+    const ok = (fs.statSync(probe).mode & 0o111) === 0o111;
+    fs.unlinkSync(probe);
+    return ok;
+  })();
+
+  await test('installWrappers chmods POSIX wrappers to 0755 (host-dir test, injected platform)', () => {
+    // Windows hosts cannot represent POSIX x-bits; the chmod CALL is still
+    // exercised below, only the mode ASSERTION is host-dependent.
+    const binDir = tmpDir();
+    const res = installer.installWrappers({
+      dryRun: false,
+      binDir,
+      nodeExe: '/usr/bin/node',
+      claudeLaunch: { command: '/usr/local/bin/claude', prefixArgs: [] },
+      platform: 'linux',
+    });
+    assert.strictEqual(res.written.length, 2);
+    for (const w of res.written) {
+      if (chmodReportsPosixMode) {
+        const execBit = fs.statSync(w.path).mode & 0o111;
+        assert.strictEqual(execBit, 0o111, `${w.name} is executable (owner/group/other x)`);
+      }
+      assert.ok(lib.isManaged(fs.readFileSync(w.path, 'utf8')), 'marker present');
+    }
+  });
+
+  await test('uninstall removes POSIX wrappers (and Windows ones) from the same dir — dual-name scan', () => {
+    const home = tmpDir();
+    const binDir = path.join(home, '.local', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    // A Linux install wrote POSIX wrappers; a Windows install previously left .cmd copies.
+    const shFiles = lib.wrapperContents({ root: home, claudeLaunch: { command: '/usr/local/bin/claude', prefixArgs: [] }, nodeExe: '/usr/bin/node', platform: 'linux' });
+    const cmdFiles = lib.wrapperContents({ root: home, claudeLaunch: { command: 'C:\\bin\\claude.exe', prefixArgs: [] }, nodeExe: 'C:\\node\\node.exe', platform: 'win32' });
+    for (const [name, content] of Object.entries(shFiles)) fs.writeFileSync(path.join(binDir, name), content, 'utf8');
+    for (const [name, content] of Object.entries(cmdFiles)) fs.writeFileSync(path.join(binDir, name), content, 'utf8');
+    const realHomedir = os.homedir;
+    os.homedir = () => home;
+    const origRun = installer.runClaude;
+    installer.runClaude = () => ({ ok: true, stdout: 'ok' });
+    let code;
+    try {
+      code = uninstaller.main(['--json']);
+    } finally {
+      os.homedir = realHomedir;
+      installer.runClaude = origRun;
+    }
+    assert.strictEqual(code, 0);
+    assert.strictEqual(fs.readdirSync(binDir).length, 0, 'both wrapper families removed');
+  });
+
+  await test('unmanaged POSIX wrapper (no marker) is never removed', () => {
+    const home = tmpDir();
+    const binDir = path.join(home, '.local', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const foreign = '#!/usr/bin/env sh\necho my own claude-telegram\n';
+    fs.writeFileSync(path.join(binDir, lib.CLAUDE_TELEGRAM_SH), foreign, 'utf8');
+    const realHomedir = os.homedir;
+    os.homedir = () => home;
+    const origRun = installer.runClaude;
+    installer.runClaude = () => ({ ok: true, stdout: 'ok' });
+    try {
+      const code = uninstaller.main(['--json']);
+      assert.strictEqual(code, 0);
+      assert.strictEqual(fs.readFileSync(path.join(binDir, lib.CLAUDE_TELEGRAM_SH), 'utf8'), foreign, 'foreign POSIX wrapper untouched');
+    } finally {
+      os.homedir = realHomedir;
+      installer.runClaude = origRun;
+    }
+  });
+
+  await test('defaultWrapperDirs on linux/darwin: only ~/.local/bin (no APPDATA dependence)', () => {
+    const dirs = lib.defaultWrapperDirs({ env: {}, home: '/home/u', platform: 'linux' });
+    assert.deepStrictEqual(dirs, ['/home/u/.local/bin']);
+    const dirsMac = lib.defaultWrapperDirs({ env: {}, home: '/Users/u', platform: 'darwin' });
+    assert.deepStrictEqual(dirsMac, ['/Users/u/.local/bin']);
+  });
+
+  await test('isDirectoryOnPath on POSIX: colon delimiter, case-sensitive (host-independent)', () => {
+    const env = { PATH: '/home/u/.local/bin:/usr/bin' };
+    assert.strictEqual(lib.isDirectoryOnPath('/home/u/.local/bin', { env, platform: 'linux' }), true);
+    assert.strictEqual(lib.isDirectoryOnPath('/home/u/.local/bin/', { env, platform: 'linux' }), true, 'trailing slash tolerated via resolve');
+    assert.strictEqual(lib.isDirectoryOnPath('/HOME/U/.LOCAL/BIN', { env, platform: 'linux' }), false);
+    assert.strictEqual(lib.isDirectoryOnPath('/usr/local/bin', { env, platform: 'linux' }), false);
+  });
+
+  await test('Unix Claude resolution: explicit absolute CLAUDE_BIN to a real file resolves with empty prefixArgs', () => {
+    const dir = tmpDir();
+    const exe = path.join(dir, 'claude');
+    fs.writeFileSync(exe, '#!/bin/sh\n', 'utf8');
+    const spec = resolveClaudeLaunch(exe, { fsImpl: fs, platform: 'linux' });
+    assert.ok(spec.ok, spec.error);
+    assert.deepStrictEqual(spec.prefixArgs, [], 'a native Unix executable needs no prefix args');
+  });
+
+  await test('Unix shim logic is NOT applied on linux (no .cmd/.bat scan)', () => {
+    // A bare name that does not exist on a POSIX PATH fails with the not-found
+    // error — the resolver does not go hunting for Windows shims there.
+    const env = { PATH: '/nonexistent-dir-for-sure' };
+    const spec = resolveClaudeLaunch('claude', { fsImpl: fs, platform: 'linux', env });
+    assert.strictEqual(spec.ok, false);
+    assert.ok(/was not found on PATH/.test(spec.error), 'clear not-found error, no Windows shim fallback');
+  });
+
+  await test('installMcp dry-run plans a POSIX registration (pinned node, launcher arg)', () => {
+    const home = tmpDir();
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: {} }), 'utf8');
+    const res = installer.installMcp({
+      dryRun: true,
+      home,
+      nodeExe: '/usr/bin/node',
+      claudeLaunch: { command: '/usr/local/bin/claude', prefixArgs: [] },
+    });
+    assert.strictEqual(res.action, 'add');
+    assert.deepStrictEqual(res.args, ['mcp', 'add', '-s', 'user', 'telegram-bridge', '--', '/usr/bin/node', path.join(libDirRoot(), 'scripts', 'launch-channel.js')]);
+  });
+
   await test('installMcp plans a rollback of the previous registration when add fails (non-dry-run, stubbed runClaude)', () => {
     const home = tmpDir();
     const ours = path.join(libDirRoot(), 'scripts', 'launch-channel.js');

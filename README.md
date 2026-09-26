@@ -16,6 +16,7 @@ start and stop your VPN whenever you like.
 - Switch a chat between sessions, list files, download project files
 - Install the Channel **once per user** — no per-project `.mcp.json`
 - Use one central bot for all sessions (single Telegram poller)
+- Run on **Windows, macOS and Linux** (global installer supported on all three)
 
 ## How it works
 
@@ -45,28 +46,38 @@ Details and internals: [DOCUMENTATION.md](DOCUMENTATION.md).
 
 ### 1. Prerequisites
 
-- Windows (primary target), Git, Node.js 20+, npm
+Same for all platforms:
+
+- Git, Node.js 20+, npm
 - Claude Code installed and working
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Your numeric Telegram user ID (from @userinfobot)
 
 ### 2. Clone
 
-```cmd
+```bash
 git clone https://github.com/AliShahsavandInanloo/telegram-claude-bridge.git
 cd telegram-claude-bridge
 ```
 
 ### 3. Install dependencies
 
-```cmd
+```bash
 npm ci
 ```
 
 ### 4. Create the configuration
 
+Windows:
+
 ```cmd
 copy .env.example .env
+```
+
+macOS / Linux:
+
+```bash
+cp .env.example .env
 ```
 
 Then edit `.env` and fill in the two required values:
@@ -80,22 +91,24 @@ Never paste secrets into public chats, and never commit `.env`.
 
 ### 5. Install globally
 
-```cmd
+```bash
 npm run install-global
 ```
 
-This registers, for your Windows user:
+Same command on all platforms. This registers, for your user:
 
 - the `telegram-bridge` MCP server (user scope, visible in every project)
 - the `telegram-claude-bridge` command (starts the central Bridge)
 - the `claude-telegram` command (Claude Code with the Channel enabled)
 
-The wrapper directory is verified against PATH; if the default is not on PATH
-the installer uses the npm global bin directory or tells you exactly what to do.
+Windows installs `.cmd` wrappers; macOS and Linux install executable `sh`
+scripts into a user-writable directory on PATH (`~/.local/bin` by default, the
+npm global bin directory as fallback). The directory is verified against PATH —
+never assumed — and your PATH is never modified automatically.
 
 ### 6. Start the Bridge
 
-```cmd
+```bash
 telegram-claude-bridge
 ```
 
@@ -104,8 +117,17 @@ authorized. Leave it running — it is the only Telegram poller.
 
 ### 7. Start Claude in any project
 
+Windows:
+
 ```cmd
 cd C:\Projects\my-project
+claude-telegram
+```
+
+macOS / Linux:
+
+```bash
+cd ~/Projects/my-project
 claude-telegram
 ```
 
@@ -213,8 +235,9 @@ In short:
 ## Troubleshooting
 
 - **`EADDRINUSE 127.0.0.1:<port>`** — the Channel port is taken. Find the
-  owning process (`netstat -ano | findstr :<port>`), stop it, or set another
-  `CLAUDE_CHANNEL_PORT` in `.env`.
+  owning process and stop it, or set another `CLAUDE_CHANNEL_PORT` in `.env`.
+  Windows: `netstat -ano | findstr :<port>` · macOS: `lsof -i :<port>` ·
+  Linux: `ss -ltnp 'sport = :<port>'`
 - **Telegram errors about getUpdates conflict** — another process is polling
   the same bot token. Stop the other poller; only one is allowed.
 - **My session never appears in `/sessions`** — start Claude with

@@ -26,6 +26,7 @@ const os = require('os');
 const {
   MCP_SERVER_NAME,
   WRAPPER_NAMES,
+  POSIX_WRAPPER_NAMES,
   defaultWrapperDirs,
   isManaged,
   buildMcpRemoveArgs,
@@ -119,10 +120,12 @@ function main(argv = process.argv.slice(2)) {
   }
 
   // ---- Wrapper commands ----------------------------------------------------
-  // Every wrapper name may exist in more than one candidate location (e.g.
-  // after a PATH fallback install); ALL installer-owned copies are removed
-  // and reported. Unmanaged same-name files are never touched.
-  for (const name of WRAPPER_NAMES) {
+  // Look for BOTH wrapper families in every candidate directory: the Windows
+  // .cmd names and the POSIX names. This makes uninstall work regardless of
+  // which platform installed the wrappers (e.g. a bin dir synced or moved
+  // between machines) — and only ownership-marked files are ever removed.
+  const names = [...WRAPPER_NAMES, ...POSIX_WRAPPER_NAMES];
+  for (const name of names) {
     let foundInAnyDir = false;
     for (const dir of binDirs) {
       const target = path.join(dir, name);

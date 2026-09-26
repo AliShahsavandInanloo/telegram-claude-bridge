@@ -119,11 +119,22 @@ claude -p "Reply with exactly: BRIDGE_TEST_OK"
 
 ## 4. One-time setup
 
-```cmd
+```bash
 git clone https://github.com/AliShahsavandInanloo/telegram-claude-bridge.git
 cd telegram-claude-bridge
 npm install
+```
+
+Create the configuration file (same variable names on every platform):
+
+```cmd
+:: Windows
 copy .env.example .env
+```
+
+```bash
+# macOS / Linux
+cp .env.example .env
 ```
 
 Then edit `.env` — **both variables are required; the bridge refuses to start
@@ -675,9 +686,9 @@ dropped; everything is authenticated with the per-install secret from
 
 ### Global installation
 
-Installs the Channel **once** for the current Windows user, so no project ever
-needs its own `.mcp.json`, and the port and channel secret are never typed
-again.
+Installs the Channel **once** for the current user (Windows, macOS or Linux),
+so no project ever needs its own `.mcp.json`, and the port and channel secret
+are never typed again.
 
 ```cmd
 cd <bridge>
@@ -732,6 +743,16 @@ So the secret stays in the same 0600 file the Bridge already generates: it is
 never written to `~/.claude.json`, never committed, and never lands in a command
 line. An exported `CLAUDE_CHANNEL_SECRET` still takes precedence, so the manual
 per-project mode above keeps working unchanged.
+
+**Platform support.** The global installer works on Windows, macOS and Linux
+with the same command (`npm run install-global`). Windows receives `.cmd`
+wrappers; macOS and Linux receive executable `#!/usr/bin/env sh` scripts
+(installed with mode 0755, no extension) named `claude-telegram` and
+`telegram-claude-bridge`. Claude launch resolution is platform-aware: Unix
+installs resolve the `claude` executable from PATH directly (the Windows
+`.cmd`/`.bat` shim modeling is never applied there), and native `CLAUDE_BIN`
+paths work on all platforms. Uninstall scans both wrapper families in the
+default locations, so a directory used by either platform kind is cleaned.
 
 **Maintenance:**
 

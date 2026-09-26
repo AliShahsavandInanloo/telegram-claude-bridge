@@ -42,6 +42,7 @@ const { findExecutableInPath, resolveClaudeLaunch } = require(path.join(ROOT, 'l
 const {
   MCP_SERVER_NAME,
   WRAPPER_NAMES,
+  wrapperNamesFor,
   defaultBinDir,
   isDirectoryOnPath,
   resolveBinDir,
@@ -229,14 +230,15 @@ function installMcp({ dryRun, home = os.homedir(), nodeExe = 'node', claudeLaunc
   };
 }
 
-function installWrappers({ dryRun, binDir, nodeExe = 'node', claudeLaunch = null }) {
-  const files = wrapperContents({ root: ROOT, claudeLaunch, nodeExe: nodeExe || 'node' });
+function installWrappers({ dryRun, binDir, nodeExe = 'node', claudeLaunch = null, platform = process.platform }) {
+  const names = wrapperNamesFor(platform);
+  const files = wrapperContents({ root: ROOT, claudeLaunch, nodeExe: nodeExe || 'node', platform });
   const written = [];
   const skipped = [];
 
   if (!dryRun && !fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
 
-  for (const name of WRAPPER_NAMES) {
+  for (const name of names) {
     const target = path.join(binDir, name);
     let existing = null;
     try {
@@ -249,12 +251,18 @@ function installWrappers({ dryRun, binDir, nodeExe = 'node', claudeLaunch = null
       continue;
     }
     const status = existing === null ? 'created' : 'updated';
-    if (!dryRun) fs.writeFileSync(target, files[name], 'utf8');
+    if (!dryRun) {
+      fs.writeFileSync(target, files[name], 'utf8');
+      if (platform !== 'win32') {
+        // POSIX wrappers must be executable to be usable from a shell/PATH.
+        fs.chmodSync(target, 0o755);
+      }
+    }
     written.push({ name, path: target, status });
   }
 
   const launch = claudeLaunch || { command: 'claude', prefixArgs: [] };
-  return { binDir, written, skipped, claudeLaunch: launch };
+  return { binDir, written, skipped, claudeLaunch: launch, platform };
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,8 @@ regular [manual installation](README.md#installation) — both methods use the
 **same** supported installer (`npm run install-global`); this document adds no
 second installer, it only orchestrates it.
 
-**How to use:** open your coding agent on a Windows computer, copy everything in
+**How to use:** open your coding agent on the target computer (Windows, macOS,
+or Linux — all three are supported), copy everything in
 the prompt section below, paste it into the agent, and follow its questions. You
 will only need to enter your Telegram secrets locally at the end.
 
@@ -19,17 +20,20 @@ Copy everything below this line into your coding agent.
 
 ---
 
-Install telegram-claude-bridge on this Windows computer.
+Install telegram-claude-bridge on this computer.
 
 Repository: https://github.com/AliShahsavandInanloo/telegram-claude-bridge
 
 Goal: install the Telegram ↔ Claude Code Bridge and its global Claude Code
-Channel integration for this Windows user. Do not modify unrelated applications
-or Claude configuration. Do not expose secrets.
+Channel integration for this user. First detect the operating system
+(Windows, macOS, or Linux) and use the appropriate commands for it throughout
+(`copy` vs `cp`, PATH syntax, process tools). The global installer supports
+all three platforms. Do not modify unrelated applications or Claude
+configuration. Do not expose secrets.
 
 **FIRST: CHECK PREREQUISITES**
 
-Verify Windows, Git, Node.js, npm, and Claude Code by running:
+Verify the OS, Git, Node.js, npm, and Claude Code by running:
 
     git --version
     node --version
@@ -49,8 +53,9 @@ modifications and never run `git reset --hard` or any destructive cleanup
 without explicit user approval.
 
 If it is not already installed: choose a sensible user-writable installation
-location, preferably `%USERPROFILE%\Claude\telegram-claude-bridge` or another
-existing user development directory. Do NOT require Administrator privileges.
+location — for example `%USERPROFILE%\Claude\telegram-claude-bridge` on
+Windows or `~/telegram-claude-bridge` on macOS/Linux — or another existing
+user development directory. Do NOT require Administrator or sudo privileges.
 Clone:
 
     git clone https://github.com/AliShahsavandInanloo/telegram-claude-bridge.git
@@ -96,7 +101,8 @@ stop the conflicting application, or configure another `CLAUDE_CHANNEL_PORT`.
 The installer verifies that the wrapper directory is on PATH instead of
 assuming it. If it reports the chosen bin directory is not on PATH (or exits
 non-zero with that warning), identify a safe user-writable directory that IS
-already on PATH (for example `%APPDATA%\npm`) and re-run:
+already on PATH (for example `%APPDATA%\npm` on Windows, `~/.local/bin` on
+macOS/Linux if present) and re-run:
 
     npm run install-global -- --bin-dir "<user-writable directory already on PATH>"
 
@@ -215,7 +221,7 @@ changes to the repository.
 
 ## What the agent will do
 
-1. Verify Windows / Git / Node / npm / Claude Code prerequisites.
+1. Verify OS, Git, Node, npm, and Claude Code prerequisites.
 2. Clone (or safely update) the repository into a user-writable directory.
 3. `npm ci` → `npm run check` → `npm test` — it stops if validation fails.
 4. Copy `.env.example` → `.env` and ask **you** to enter the bot token and
