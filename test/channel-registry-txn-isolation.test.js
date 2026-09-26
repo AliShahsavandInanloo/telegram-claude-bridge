@@ -1093,6 +1093,225 @@ test('meta: save-control reject() produces a genuine rejection (not resolve-with
   assert.ok(true);
 });
 
+// ---------------------------------------------------------------------------
+// 5. GRACEFUL-SHUTDOWN DURABILITY
+//
+// stopAll() must be durable: it may never return success while its
+// manager-owned pending registry updates are still unapplied, the shutdown
+// status must survive the child-close callback, and the Bridge's shutdown
+// sequence must flush touches + Channel-offline state before exit.
+// ---------------------------------------------------------------------------
+
+test('shutdown: stopAll returns a pending promise while the save is held; kill stays immediate', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+  const child = children[0];
+  const origKill = child.kill;
+  let killed = false;
+  child.kill = (...args) => {
+    killed = true;
+    return origKill.apply(child, args);
+  };
+
+  // Hold the save BEFORE shutdown so stopAll's flush cannot complete.
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+
+  const p = mgr.stopAll();
+  assert.ok(p && typeof p.then === 'function', 'stopAll returns a promise');
+  assert.strictEqual(killed, true, 'process kill is IMMEDIATE (never delayed by the save debounce)');
+
+  let settled = false;
+  p.then(() => {
+    settled = true;
+  });
+  await sleep(20);
+  assert.strictEqual(ctl.deferreds.length, 1, 'stopAll flush reached the save');
+  assert.strictEqual(settled, false, 'stopAll promise is still PENDING while the save is held');
+  assert.strictEqual(reg.transactionBusy(), true, 'save pending inside the manager transaction (mutation staged, not yet durable)');
+
+  ctl.deferreds[0].resolve();
+  await p;
+  await sleep(10); // let the transaction tail release the lock
+  assert.strictEqual(settled, true, 'stopAll resolves only after persistence');
+  assert.strictEqual(reg.get(a.id).status, 'stopped', 'shutdown status applied');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle after shutdown');
+  reg.save = origSave;
+});
+
+test('shutdown: claudeSessionId queued right before stopAll persists without waiting the debounce timer', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+  const UUID = '0e5b3a2e-1d2f-4c6b-9a3f-00000000abcd';
+  children[0].fireOut(JSON.stringify({ type: 'system', subtype: 'init', session_id: UUID }) + '\n');
+  assert.strictEqual(reg.get(a.id).claudeSessionId, null, 'session id staged outside the registry');
+
+  const p = mgr.stopAll(); // immediate shutdown — the 100 s debounce never fires
+  await p;
+  assert.strictEqual(reg.get(a.id).claudeSessionId, UUID, 'queued session id applied by the shutdown flush');
+  assert.strictEqual(reg.get(a.id).initialized, true, 'initialized flag set with the session id');
+  const reread = createRegistry(file);
+  assert.strictEqual(reread.get(a.id).claudeSessionId, UUID, 'session id DURABLE on disk');
+  assert.strictEqual(reread.get(a.id).initialized, true, 'initialized durable on disk');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('shutdown: stopped status persists through stopAll; late child close cannot flip it to idle', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+  const child = children[0];
+
+  const p = mgr.stopAll(); // stages 'stopped' BEFORE kill; kill fires close synchronously
+  await p;
+  assert.strictEqual(reg.get(a.id).status, 'stopped', 'shutdown status won over the child-close callback');
+
+  // A LATE close event (out-of-order exit notification) must not resurrect idle.
+  child.kill();
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(a.id).status, 'stopped', 'late child exit cannot overwrite the shutdown intent');
+  const reread = createRegistry(file);
+  assert.strictEqual(reread.get(a.id).status, 'stopped', 'stopped status DURABLE on disk');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('shutdown: stopAll does not hang when the final save fails; the stopped intent survives for the next flush', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  const a = reg.create({ name: 'alpha', project: proj }).entry;
+  await reg.save();
+  const children = [];
+  const mgr = makeManagerCapturing(reg, children);
+  mgr.startSession(a.id);
+
+  const ctl = makeSaveControl();
+  const origSave = reg.save;
+  reg.save = () => ctl.saveImpl();
+  const p = mgr.stopAll();
+  await waitFor(() => ctl.deferreds.length === 1, 'shutdown save reached');
+  ctl.deferreds[0].reject(new Error('disk gone during shutdown'));
+  await Promise.race([p, sleep(500).then(() => { throw new Error('stopAll hung on a failed save'); })]);
+  assert.strictEqual(reg.get(a.id).status, 'idle', 'failed flush rolled back to the previous status');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock released after the failure');
+
+  // The re-queued intent (no retry loop) is applied by the next flush.
+  reg.save = origSave;
+  await mgr._persistNow();
+  assert.strictEqual(reg.get(a.id).status, 'stopped', 'stopped intent survived and applied by the next flush');
+});
+
+test('shutdown: a queued touch (timer never fired) is persisted by flushTouches', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const proj = makeProject(dir);
+  const e = reg.create({ name: 'touchy', project: proj }).entry;
+  reg.get(e.id).lastActivity = '1970-01-01T00:00:00.000Z';
+  await reg.save();
+
+  reg.touch(e.id); // queued; the unref'd 400 ms timer must NOT be relied on
+  await reg.flushTouches(); // the shutdown flush path
+  await sleep(10); // let the transaction tail release the lock
+  assert.notStrictEqual(reg.get(e.id).lastActivity, '1970-01-01T00:00:00.000Z', 'lastActivity applied');
+  const reread = createRegistry(file);
+  assert.notStrictEqual(reread.get(e.id).lastActivity, '1970-01-01T00:00:00.000Z', 'lastActivity DURABLE on disk');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('shutdown: Channel offline state persists — reloaded registry shows connected=false', async () => {
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const file = path.join(dir, 'r.json');
+  const hub = makeHub(reg);
+  const conn = await register(hub, 'client-shut', 'ShutOffline', 1);
+  await sleep(30);
+  const entry = reg.getByName('shutoffline');
+  assert.ok(entry, 'channel session registered');
+  assert.strictEqual(entry.connected, true, 'connected=true while online');
+
+  // THE BRIDGE SHUTDOWN SEQUENCE (post-hub-close tail):
+  hub.close();
+  await reg.awaitTransactions(); // barrier: queued txns settled
+  await reg.flushTouches();
+  await reg.save(); // final persist of the offline state
+  await reg.flush(); // disk writes durable
+
+  assert.strictEqual(reg.get(entry.id).connected, false, 'in-memory offline after close');
+  const reread = createRegistry(file);
+  assert.strictEqual(reread.get(entry.id).connected, false, 'offline state DURABLE on disk');
+  assert.strictEqual(reread.get(entry.id).status, 'idle', 'offline status durable');
+  assert.strictEqual(hub.onlineIds().length, 0, 'no session remains online after close');
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
+test('shutdown: registry flush with a never-resolving save times out, warns, and does not hang', async () => {
+  // The bridge shutdown helper is exercised with a tiny timeout and a wedged
+  // save: it must warn and settle (the caller then exits anyway).
+  process.env.BRIDGE_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tgbridge-shutd-'));
+  process.env.TELEGRAM_BOT_TOKEN = '123456789:TEST_TOKEN_FOR_TESTS_ONLY_TESTING';
+  process.env.ALLOWED_TELEGRAM_IDS = '111';
+  process.env.CLAUDE_BIN = '';
+  const { shutdownRegistryFlush } = require('../bridge.js').__test;
+
+  const warnings = [];
+  const wedged = {
+    awaitTransactions: () => Promise.resolve(),
+    flushTouches: () => Promise.resolve(),
+    save: () => new Promise(() => {}), // NEVER resolves
+    flush: () => new Promise(() => {}),
+  };
+  const start = Date.now();
+  await Promise.race([
+    shutdownRegistryFlush(wedged, 50, (msg) => warnings.push(msg)),
+    sleep(2000).then(() => { throw new Error('shutdownRegistryFlush hung on a never-resolving save'); }),
+  ]);
+  const elapsed = Date.now() - start;
+  assert.strictEqual(warnings.length, 1, 'exactly one timeout warning logged');
+  assert.ok(/timed out/.test(warnings[0]), `warning mentions the timeout: ${warnings[0]}`);
+  assert.ok(elapsed < 1000, `bounded: settled in ${elapsed}ms, not at the 2 s guard`);
+});
+
+test('shutdown: a normal successful flush does NOT wait for the full timeout', async () => {
+  process.env.BRIDGE_STATE_DIR = process.env.BRIDGE_STATE_DIR || fs.mkdtempSync(path.join(os.tmpdir(), 'tgbridge-shutd-'));
+  process.env.TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '123456789:TEST_TOKEN_FOR_TESTS_ONLY_TESTING';
+  process.env.ALLOWED_TELEGRAM_IDS = process.env.ALLOWED_TELEGRAM_IDS || '111';
+  process.env.CLAUDE_BIN = process.env.CLAUDE_BIN || '';
+  const { shutdownRegistryFlush } = require('../bridge.js').__test;
+
+  const dir = tmpDir();
+  const reg = createRegistry(path.join(dir, 'r.json'));
+  const proj = makeProject(dir);
+  reg.create({ name: 'quick', project: proj });
+  const warnings = [];
+  const start = Date.now();
+  await shutdownRegistryFlush(reg, 5000, (msg) => warnings.push(msg));
+  const elapsed = Date.now() - start;
+  assert.strictEqual(warnings.length, 0, 'no timeout warning on success');
+  assert.ok(elapsed < 1000, `fast path: settled in ${elapsed}ms, far below the 5 s budget`);
+  assert.strictEqual(reg.transactionBusy(), false, 'registry transaction lock idle');
+});
+
 process.on('unhandledRejection', (err) => {
   console.error('UNHANDLED REJECTION:', err);
   process.exit(2);

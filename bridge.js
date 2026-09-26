@@ -1301,6 +1301,30 @@ async function pollLoop(startOffset) {
 
 let shuttingDown = false;
 
+/** Final persistence budget: a broken/slow disk must not hang Ctrl+C forever. */
+const SHUTDOWN_FLUSH_TIMEOUT_MS = 5000;
+
+/**
+ * Bounded registry shutdown flush: settles queued transactions, flushes
+ * coalesced touches, performs ONE final save (Channel-offline / manager
+ * state) and awaits its disk writes. A broken/slow disk must not hang
+ * Ctrl+C forever — on timeout a warning is logged and the caller exits.
+ * (Exported for tests; injected with a small timeout there.)
+ */
+async function shutdownRegistryFlush(regLike, timeoutMs, warn = logWarn) {
+  await Promise.race([
+    (async () => {
+      await regLike.awaitTransactions(); // barrier: queued txns settled before the final save
+      await regLike.flushTouches(); // coalesced lastActivity (resolves immediately if empty)
+      await regLike.save(); // final Channel-offline/manager state — never exit mid-atomic-write
+      await regLike.flush(); // the save's disk writes are durable
+    })(),
+    sleep(timeoutMs).then(() => {
+      warn(`registry shutdown flush timed out after ${timeoutMs}ms — exiting anyway`);
+    }),
+  ]);
+}
+
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true; // 1. mark shutting down (poll loop + handlers check this)
@@ -1320,9 +1344,31 @@ function shutdown(signal) {
       }
     }, 3000);
   }
-  Promise.race([store.flush(), sleep(3000)]).then(() => { // 6-7.
-    channelHub.close();
-    claudeManager.stopAll(); // stop managed stream-json processes; registry flushed
+
+  /**
+   * BOUNDED DURABLE SHUTDOWN (6-10):
+   *
+   * flush legacy store -> stop managed Claude processes and AWAIT their
+   * pending registry updates -> close the Channel hub (marks sessions
+   * offline) -> settle queued registry transactions -> flush coalesced
+   * touches -> one final registry save (Channel-offline state) -> await
+   * disk writes -> exit. Never exits mid-atomic-write: we either await the
+   * persistence (or its logged failure) or hit the bounded timeout.
+   */
+  (async () => {
+    await Promise.race([store.flush(), sleep(3000)]); // 6-7. legacy store, existing 3s policy
+    try {
+      await claudeManager.stopAll(); // 8. kill processes immediately; awaited pending flush
+    } catch (err) {
+      logWarn('managed-session shutdown flush failed:', err.message || err);
+    }
+    channelHub.close(); // 9. mark Channel sessions offline (in-memory + registry mutation)
+    // 10-12. settle queued transactions, flush touches, final save + disk writes.
+    await shutdownRegistryFlush(registry, SHUTDOWN_FLUSH_TIMEOUT_MS);
+    logInfo('bye');
+    process.exit(0);
+  })().catch((err) => {
+    logWarn('shutdown persistence error:', err.message || err);
     logInfo('bye');
     process.exit(0);
   });
@@ -1461,6 +1507,7 @@ module.exports = {
     purgeBacklogIfFirstStart,
     registry,
     claudeManager,
+    shutdownRegistryFlush,
     resolveSessionArg,
     listNumbered,
     routeToManaged,
