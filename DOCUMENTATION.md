@@ -193,11 +193,19 @@ drives `/help`.
 | `/stop` | cancel the running job **of this chat** (SIGTERM) and clear this chat's queued jobs; reports what was cancelled/removed |
 | `/queue` | running job, queued in this chat, global queued count |
 | `/status` | Claude executable, active session, running job, queue, proxy (credentials redacted), uptime |
+| `/session_status` | process state, current task, runtime, latest output of the attached session |
+| `/terminate_session confirm` | explicitly stop the attached session's Claude process |
 | any other text | becomes the prompt for the active session; the report comes back here |
 
 Group-style suffixes work: `/status@YourBot` is accepted; commands addressed to
 a **different** bot are ignored. Non-text messages (photos, stickers, edits)
 are ignored. `/stop` and `/queue` only ever affect the chat that issued them.
+
+Telegram Bot API command names may only contain `a-z`, `0-9` and `_`, so the
+menu registers `/session_status` and `/terminate_session`. The older hyphenated
+spellings (`/session-status`, `/terminate-session`) remain accepted as
+**backward-compatible aliases** — they are normalized to the canonical forms
+before dispatch — but they never appear in the Telegram command menu.
 
 ---
 
@@ -852,7 +860,7 @@ are queued FIFO, each queued task resolves with its own final result, output
 streams to Telegram rate-limited, `MANAGED_TASK_TIMEOUT_MS` (default 4 h)
 applies. Registry entries record `transport` so `/sessions` can show which
 sessions are Channel vs stream-json. `/stop` never kills a Channel session
-(only Bridge-side work); `/terminate-session confirm` explicitly stops a
+(only Bridge-side work); `/terminate_session confirm` explicitly stops a
 stream-json process.
 
 ### Files

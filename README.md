@@ -247,13 +247,13 @@ Full reference: [DOCUMENTATION.md](DOCUMENTATION.md#configuration).
 | `/switch <name\|number>` | switch to another connected session |
 | `/detach` | detach from the current session |
 | `/current` | show the currently attached session |
-| `/session-status` | process state, current task, runtime, latest output |
+| `/session_status` | process state, current task, runtime, latest output |
 | `/files` | list files in the attached project |
 | `/download <file>` | send a project file back here |
 | `/discover` | list running Claude processes (read-only inventory) |
 | `/queue` | what's running and how many jobs are queued |
 | `/stop` | cancel this chat's Bridge-side work (Channel sessions keep running) |
-| `/terminate-session confirm` | explicitly stop a managed session process |
+| `/terminate_session confirm` | explicitly stop a managed session process |
 | `/status` | Claude executable, active session, queue, proxy (redacted), uptime |
 
 Any other text is a task for the attached session — or the active one-shot

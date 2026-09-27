@@ -1,5 +1,8 @@
 'use strict';
 
+// Test isolation: marks this process as a test so lib guards refuse real state/ paths.
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+
 /**
  * Tests for the Claude Session Manager subsystem (registry, launcher adapter,
  * managed session, manager routing, output streaming, discovery).

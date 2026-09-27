@@ -1,5 +1,8 @@
 'use strict';
 
+// Test isolation: marks this process as a test so lib guards refuse real state/ paths.
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+
 /**
  * Tests for the Claude Code Channel integration: IPC auth/framing, hub
  * registration & reconcile, Telegram->channel routing isolation, reply/file

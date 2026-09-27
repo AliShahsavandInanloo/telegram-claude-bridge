@@ -1,5 +1,8 @@
 'use strict';
 
+// Test isolation: marks this process as a test so lib guards refuse real state/ paths.
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+
 /**
  * Regression tests for hardening passes 2 and 3.
  * Run with `node test/regression.test.js` (wired into `npm test`).
@@ -1136,7 +1139,7 @@ function memOffsetStore(initialCommits = [], loadState = missingState) {
   await test('session manager: help lists the new commands', () => {
     const { helpText } = require('../lib/commands');
     const h = helpText('Bot');
-    for (const c of ['attach', 'detach', 'current', 'session-status', 'files', 'download', 'discover']) {
+    for (const c of ['attach', 'detach', 'current', 'session_status', 'files', 'download', 'discover']) {
       assert.ok(h.includes(`/${c}`), `help missing /${c}`);
     }
   });

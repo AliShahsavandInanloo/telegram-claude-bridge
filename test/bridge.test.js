@@ -1,5 +1,8 @@
 'use strict';
 
+// Test isolation: marks this process as a test so lib guards refuse real state/ paths.
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+
 /**
  * Lightweight test suite (no framework) — run with `npm test`.
  * Covers the behaviors mandated in the hardening pass.
@@ -133,13 +136,58 @@ function lastSends(n = 1) {
     assert.strictEqual(parseCommand('hello'), null);
   });
 
+  await test('hyphenated legacy commands normalize to canonical underscore forms', () => {
+    // Canonical forms dispatch unchanged:
+    assert.strictEqual(parseCommand('/session_status').cmd, 'session_status');
+    assert.strictEqual(parseCommand('/terminate_session confirm').cmd, 'terminate_session');
+    assert.strictEqual(parseCommand('/terminate_session confirm').arg, 'confirm');
+    // Backward-compatible hyphen aliases route to the SAME canonical handler:
+    assert.strictEqual(parseCommand('/session-status').cmd, 'session_status');
+    assert.strictEqual(parseCommand('/terminate-session confirm').cmd, 'terminate_session');
+    assert.strictEqual(parseCommand('/terminate-session confirm').arg, 'confirm');
+    // Bot-suffix forms normalize too:
+    assert.strictEqual(parseCommand('/session_status@BotName').cmd, 'session_status');
+    assert.strictEqual(parseCommand('/session-status@BotName').cmd, 'session_status');
+    assert.strictEqual(parseCommand('/terminate_session@BotName confirm').cmd, 'terminate_session');
+    assert.strictEqual(parseCommand('/terminate-session@BotName confirm').cmd, 'terminate_session');
+    // Aliases must not appear as registered (menu) names:
+    assert.strictEqual(parseCommand('/session-status').addressedTo, null);
+  });
+
+  await test('every registered bot command matches the Telegram command regex ^[a-z0-9_]{1,32}$', () => {
+    const re = /^[a-z0-9_]{1,32}$/;
+    for (const c of BOT_COMMANDS) {
+      assert.ok(re.test(c.command), `command "${c.command}" violates the Telegram name regex`);
+    }
+    const names = BOT_COMMANDS.map((c) => c.command);
+    assert.ok(names.includes('session_status'), 'canonical session_status registered');
+    assert.ok(names.includes('terminate_session'), 'canonical terminate_session registered');
+    assert.ok(!names.includes('session-status'), 'hyphenated session-status must NOT be registered');
+    assert.ok(!names.includes('terminate-session'), 'hyphenated terminate-session must NOT be registered');
+  });
+
+  await test('setMyCommands payload is Telegram-valid: underscore names, no hyphens, regex-conformant', () => {
+    // Mirrors the exact payload bridge startup sends via tg.request('setMyCommands').
+    const payload = { commands: BOT_COMMANDS };
+    assert.ok(Array.isArray(payload.commands) && payload.commands.length > 0);
+    const re = /^[a-z0-9_]{1,32}$/;
+    for (const entry of payload.commands) {
+      assert.ok(typeof entry.command === 'string' && re.test(entry.command), `payload command "${entry.command}" not Telegram-valid`);
+      assert.ok(!entry.command.includes('-'), `payload command "${entry.command}" contains a hyphen`);
+      assert.ok(typeof entry.description === 'string' && entry.description.length >= 1 && entry.description.length <= 256, `description for "${entry.command}" out of Telegram bounds`);
+    }
+    // The two previously-hyphenated commands are present under canonical names:
+    assert.ok(payload.commands.some((c) => c.command === 'session_status'));
+    assert.ok(payload.commands.some((c) => c.command === 'terminate_session'));
+  });
+
   await test('registered command definitions match implemented commands (issue 9/15/17)', () => {
     // BOT_COMMANDS is the single source of truth; dispatcher must cover it.
     const names = BOT_COMMANDS.map((c) => c.command);
     assert.strictEqual(new Set(names).size, names.length, 'no duplicates');
     assert.deepStrictEqual(
       new Set(names),
-      new Set(['start', 'help', 'new', 'sessions', 'use', 'attach', 'switch', 'detach', 'current', 'session-status', 'files', 'download', 'discover', 'stop', 'terminate-session', 'queue', 'status'])
+      new Set(['start', 'help', 'new', 'sessions', 'use', 'attach', 'switch', 'detach', 'current', 'session_status', 'files', 'download', 'discover', 'stop', 'terminate_session', 'queue', 'status'])
     );
     for (const c of BOT_COMMANDS) assert.ok(c.description && c.description.length <= 256);
   });
@@ -446,6 +494,60 @@ function lastSends(n = 1) {
   await test('bot token never appears in any outgoing Telegram send (issue 26)', () => {
     const dump = JSON.stringify(sent);
     assert.ok(!dump.includes('TEST_TOKEN_FOR_TESTS_ONLY_TESTING'), 'token leaked into a Telegram send');
+  });
+
+  await test('production-state guard: createRegistry refuses the real state file under NODE_ENV=test', () => {
+    const { assertNotProductionStateFile, createRegistry } = require('../lib/claude/registry');
+    const realStateDir = path.join(__dirname, '..', 'state');
+    const realFile = path.join(realStateDir, 'claude-sessions.json');
+    // Direct helper:
+    assert.throws(() => assertNotProductionStateFile(realFile), /production state file/);
+    // Through the factory (what a buggy test would call):
+    assert.throws(() => createRegistry(realFile), /production state file/);
+    // Temp state is fine:
+    assertNotProductionStateFile(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tgbridge-guard-')), 'r.json'));
+    // Other files in the repo are fine (only state/ is protected):
+    assertNotProductionStateFile(path.join(__dirname, '..', 'bridge.js'));
+  });
+
+  await test('contamination regression: dispatching commands never creates/changes files under real state/', async () => {
+    // Snapshot the real state directory (if it exists) and verify the whole
+    // session-flow exercised by this suite leaves it byte-identical. This is
+    // the recurrence test for the historical tgbridge-stab-*/chanverify-*
+    // pollution of state/claude-sessions.json.
+    const realStateDir = path.join(__dirname, '..', 'state');
+    const snapshot = {};
+    if (fs.existsSync(realStateDir)) {
+      for (const f of fs.readdirSync(realStateDir)) {
+        const p = path.join(realStateDir, f);
+        if (fs.statSync(p).isFile()) snapshot[f] = fs.readFileSync(p); // buffers, compared by content
+      }
+    }
+    const realTg = T.getTelegram();
+    T.setTelegram({ request: async () => ({}), state: () => ({ agent: null, source: null, label: 'direct' }), refresh: () => {}, markFailure: () => {} });
+    try {
+      const proj = tmpDir();
+      fs.mkdirSync(proj, { recursive: true });
+      // Same flows that historically leaked: /new (registry write) + status + stop.
+      await T.handleMessage({ chat: { id: 555900 }, from: { id: 111 }, text: `/new contamination-probe ${proj}` });
+      await T.handleMessage({ chat: { id: 555900 }, from: { id: 111 }, text: '/session_status' });
+      await T.handleMessage({ chat: { id: 555900 }, from: { id: 111 }, text: '/terminate_session confirm' });
+      await T.handleMessage({ chat: { id: 555900 }, from: { id: 111 }, text: '/sessions' });
+    } finally {
+      T.setTelegram(realTg);
+    }
+    // The real state dir must be untouched (no new, modified, or deleted files).
+    const now = {};
+    if (fs.existsSync(realStateDir)) {
+      for (const f of fs.readdirSync(realStateDir)) {
+        const p = path.join(realStateDir, f);
+        if (fs.statSync(p).isFile()) now[f] = fs.readFileSync(p);
+      }
+    }
+    assert.deepStrictEqual(Object.keys(now).sort(), Object.keys(snapshot).sort(), 'no files added/removed in real state/');
+    for (const f of Object.keys(snapshot)) {
+      assert.ok(now[f].equals(snapshot[f]), `real state file was modified: ${f}`);
+    }
   });
 
   const summary = failures.length ? `\n${passed} passed, ${failures.length} FAILED` : `\nAll ${passed} tests passed.`;

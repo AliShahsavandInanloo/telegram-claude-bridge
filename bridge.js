@@ -906,7 +906,7 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
           return;
         }
         await claudeManager.attach(chatId, created.entry.id);
-        await reply(chatId, `✨ Managed session *${created.entry.name}* created for project ${projectLabel(created.entry.project)} and attached.\nSend any text to task it; /detach to release; /session-status for details.`);
+        await reply(chatId, `✨ Managed session *${created.entry.name}* created for project ${projectLabel(created.entry.project)} and attached.\nSend any text to task it; /detach to release; /session_status for details.`);
         return;
       }
 
@@ -1007,7 +1007,7 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
     case 'stop': {
       // /stop is scoped by transport: for Channel sessions it only cancels
       // Bridge-side work — the interactive Claude Code process is NEVER killed
-      // here (use /terminate-session for that).
+      // here (use /terminate_session for that).
       const removed = queue.clearChat(chatId);
       let cancelNote = 'no running job in this chat';
       if (currentRun && currentRun.chatId === chatId && !currentRun.cancelled) {
@@ -1017,27 +1017,27 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
       let channelNote = '';
       const att = registry.attached(chatId);
       if (att && att.transport === 'channel') {
-        channelNote = ' Channel session left running (use /terminate-session to stop it).';
+        channelNote = ' Channel session left running (use /terminate_session to stop it).';
       }
       await reply(chatId, `🛑 ${cancelNote}; ${removed} queued job(s) removed.${channelNote}`);
       return;
     }
 
-    case 'terminate-session': {
+    case 'terminate_session': {
       const cur = registry.attached(chatId);
       if (!cur) {
         await reply(chatId, 'No session attached.');
         return;
       }
       if (cur.transport !== 'stream-json') {
-        await reply(chatId, `⚠️ *${cur.name}* is a Channel session. /stop never kills it — /terminate-session stops the Claude Code process. Send /terminate-session confirm to proceed.`);
+        await reply(chatId, `⚠️ *${cur.name}* is a Channel session. /stop never kills it — /terminate_session stops the Claude Code process. Send /terminate_session confirm to proceed.`);
         return;
       }
       if (arg !== 'confirm') {
-        await reply(chatId, `Send /terminate-session confirm to stop *${cur.name}*'s Claude process.`);
+        await reply(chatId, `Send /terminate_session confirm to stop *${cur.name}*'s Claude process.`);
         return;
       }
-      claudeManager.stopSession(cur.id, 'terminated by /terminate-session');
+      claudeManager.stopSession(cur.id, 'terminated by /terminate_session');
       await reply(chatId, `🛑 Stopped the stream-json process for *${cur.name}*. The registry entry remains for restart.`);
       return;
     }
@@ -1102,7 +1102,7 @@ async function dispatchCommand(chatId, parsed, { userId = '', messageId = null }
       return;
     }
 
-    case 'session-status': {
+    case 'session_status': {
       const cur = claudeManager.attached(chatId);
       if (!cur) {
         await reply(chatId, 'No Claude session selected. Use /attach <name|number>.');
